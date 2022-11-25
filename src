@@ -1,0 +1,2716 @@
+classes
+RammerheadLogging.js
+/**
+ * @typedef {'disabled'|'debug'|'traffic'|'info'|'warn'|'error'} LoggingLevels
+ */
+
+const LOG_LEVELS = ['disabled', 'debug', 'traffic', 'info', 'warn', 'error'];
+
+function defaultGeneratePrefix(level) {
+    return `[${new Date().toISOString()}] [${level.toUpperCase()}] `;
+}
+
+class RammerheadLogging {
+    /**
+     * @param {object} options
+     * @param {LoggingLevels} options.logLevel - logLevel to initialize the logger with
+     * @param {(data: string) => void} options.logger - expects the logger to automatically add a newline, just like what console.log does
+     * @param {*} options.loggerThis - logger will be called with loggerThis binded
+     * @param {(level: LoggingLevels) => string} options.generatePrefix - generates a prefix before every log. set to null to disable
+     */
+    constructor({
+        logLevel = 'info',
+        logger = console.log,
+        loggerThis = console,
+        generatePrefix = defaultGeneratePrefix
+    } = {}) {
+        this.logger = logger;
+        this.loggerThis = loggerThis;
+        this.generatePrefix = generatePrefix;
+
+        /**
+         * @private
+         */
+        this._logRank = this._getLogRank(logLevel);
+    }
+
+    get logLevel() {
+        return LOG_LEVELS[this._logRank];
+    }
+    /**
+     * logger() will be called based on this log level
+     * @param {LoggingLevels} level
+     */
+    set logLevel(level) {
+        this._logRank = this._getLogRank(level);
+    }
+    callLogger(data) {
+        this.logger.call(this.loggerThis, data);
+    }
+    /**
+     * @param {LoggingLevels} level
+     * @param {string} data
+     */
+    log(level, data) {
+        const rank = this._getLogRank(level);
+        // the higher the log level, the more important it is.
+        // ensure it's not disabled
+        if (rank && this._logRank <= rank) {
+            this.callLogger((this.generatePrefix ? this.generatePrefix(level) : '') + data);
+        }
+    }
+    debug = (data) => this.log('debug', data);
+    traffic = (data) => this.log('traffic', data);
+    info = (data) => this.log('info', data);
+    warn = (data) => this.log('warn', data);
+    error = (data) => this.log('error', data);
+
+    /**
+     * @private
+     * @param {LoggingLevels} level
+     * @returns {number}
+     */
+    _getLogRank(level) {
+        const index = LOG_LEVELS.indexOf(level);
+        if (index === -1) {
+            throw new TypeError(`Invalid log level '${level}'. Valid log levels: ${LOG_LEVELS.join(', ')}`);
+        }
+        return index;
+    }
+}
+
+module.exports = RammerheadLogging;
+RammerheadMemoryStore.js
+const RammerheadLogging = require('./RammerheadLogging');
+const RammerheadSession = require('./RammerheadSession');
+const RammerheadSessionAbstractStore = require('./RammerheadSessionAbstractStore');
+
+class RammerheadSessionMemoryStore extends RammerheadSessionAbstractStore {
+    /**
+     * @param {object} options
+     * @param {RammerheadLogging|undefined} options.logger
+     * @param {number|null} options.staleTimeout - if inactivity goes beyond this, then the session is deleted. null to disable
+     * @param {number|null} options.maxToLive - if now - createdAt surpasses maxToLive, then the session is deleted. null to disable
+     * @param {number} options.cleanupInterval - every cleanupInterval ms will run a cleanup check
+     */
+    constructor({
+        logger = new RammerheadLogging({ logLevel: 'disabled' }),
+        staleTimeout = 1000 * 60 * 30, // 30 minutes
+        maxToLive = 1000 * 60 * 60 * 4, // 4 hours
+        cleanupInterval = 1000 * 60 * 1 // 1 minute
+    } = {}) {
+        super();
+        this.logger = logger;
+        this.mapStore = new Map();
+        setInterval(() => this._cleanupRun(staleTimeout, maxToLive), cleanupInterval).unref();
+    }
+
+    /**
+     * @returns {string[]} - list of session ids in store
+     */
+    keys() {
+        return Array.from(this.mapStore.keys());
+    }
+    /**
+     * @param {string} id
+     * @returns {boolean}
+     */
+    has(id) {
+        const exists = this.mapStore.has(id);
+        this.logger.debug(`(MemoryStore.has) ${id} ${exists}`);
+        return exists;
+    }
+    /**
+     * @param {string} id
+     * @param {boolean} updateActiveTimestamp
+     * @returns {RammerheadSession|undefined}
+     */
+    get(id, updateActiveTimestamp = true) {
+        if (!this.has(id)) return;
+        this.logger.debug(`(MemoryStore.get) ${id} ${updateActiveTimestamp}`);
+
+        const session = this.mapStore.get(id);
+        if (updateActiveTimestamp) session.updateLastUsed();
+
+        return session;
+    }
+    /**
+     * @param {string} id
+     * @returns {RammerheadSession}
+     */
+    add(id) {
+        if (this.has(id)) throw new Error('the following session already exists: ' + id);
+        this.logger.debug(`(MemoryStore.add) ${id}`);
+        const session = new RammerheadSession({ id });
+        this.mapStore.set(id, session);
+        return session;
+    }
+    /**
+     * @param {string} id
+     * @returns {boolean} - returns true when a delete operation is performed
+     */
+    delete(id) {
+        return this.mapStore.delete(id);
+    }
+    /**
+     * @param {string} id
+     * @param {string} serializedSession
+     */
+    addSerializedSession(id, serializedSession) {
+        this.logger.debug(`(MemoryStore.addSerializedSession) adding serialized session id ${id} to store`);
+        const session = RammerheadSession.DeserializeSession(id, serializedSession);
+        session.updateLastUsed();
+        this.mapStore.set(id, session);
+        this.logger.debug(`(FileCache.addSerializedSession) added ${id}`);
+    }
+
+    /**
+     * @private
+     * @param {number|null} staleTimeout
+     * @param {number|null} maxToLive
+     */
+    _cleanupRun(staleTimeout, maxToLive) {
+        this.logger.debug(`(MemoryStore._cleanupRun) cleanup run. Need to go through ${this.mapStore.size} sessions`);
+
+        const now = Date.now();
+        for (const [sessionId, session] of this.mapStore) {
+            if (
+                (staleTimeout && now - session.lastUsed > staleTimeout) ||
+                (maxToLive && now - session.createdAt > maxToLive)
+            ) {
+                this.mapStore.delete(sessionId);
+                this.logger.debug(`(MemoryStore._cleanupRun) delete ${sessionId}`);
+            }
+        }
+
+        this.logger.debug('(MemoryStore._cleanupRun) finished cleanup run');
+    }
+}
+
+module.exports = RammerheadSessionMemoryStore;
+RammerheadProxy.js
+const http = require('http');
+const https = require('https');
+const stream = require('stream');
+const fs = require('fs');
+const path = require('path');
+const { getPathname } = require('testcafe-hammerhead/lib/utils/url');
+const { Proxy } = require('testcafe-hammerhead');
+const WebSocket = require('ws');
+const httpResponse = require('../util/httpResponse');
+const streamToString = require('../util/streamToString');
+const URLPath = require('../util/URLPath');
+const RammerheadLogging = require('../classes/RammerheadLogging');
+
+require('../util/fixCorsHeader');
+require('../util/fixWebsocket');
+require('../util/addMoreErrorGuards');
+require('../util/addUrlShuffling');
+require('../util/patchAsyncResourceProcessor');
+let addJSDiskCache = function (path, size) {
+    require('../util/addJSDiskCache')(path, size);
+    // modification only works once
+    addJSDiskCache = () => {};
+};
+
+/**
+ * taken directly from
+ * https://github.com/DevExpress/testcafe-hammerhead/blob/a9fbf7746ff347f7bdafe1f80cf7135eeac21e34/src/typings/proxy.d.ts#L1
+ * @typedef {object} ServerInfo
+ * @property {string} hostname
+ * @property {number} port
+ * @property {number} crossDomainPort
+ * @property {string} protocol
+ * @property {string} domain
+ * @property {boolean} cacheRequests
+ */
+
+/**
+ * @typedef {object} RammerheadServerInfo
+ * @property {string} hostname
+ * @property {number} port
+ * @property {'https:'|'http:'} protocol
+ */
+
+/**
+ * @private
+ * @typedef {import('./RammerheadSession')} RammerheadSession
+ */
+
+/**
+ * wrapper for hammerhead's Proxy
+ */
+class RammerheadProxy extends Proxy {
+    /**
+     *
+     * @param {object} options
+     * @param {RammerheadLogging|undefined} options.logger
+     * @param {(req: http.IncomingMessage) => string} options.loggerGetIP - use custom logic to get IP, either from headers or directly
+     * @param {string} options.bindingAddress - hostname for proxy to bind to
+     * @param {number} options.port - port for proxy to listen to
+     * @param {number|null} options.crossDomainPort - crossDomain port to simulate cross origin requests. set to null
+     * to disable using this. highly not recommended to disable this because it breaks sites that check for the origin header
+     * @param {boolean} options.dontListen - avoid calling http.listen() if you need to use sticky-session to load balance
+     * @param {http.ServerOptions} options.ssl - set to null to disable ssl
+     * @param {(req: http.IncomingMessage) => RammerheadServerInfo} options.getServerInfo - force hammerhead to rewrite using specified
+     * server info (server info includes hostname, port, and protocol). Useful for a reverse proxy setup like nginx where you
+     * need to rewrite the hostname/port/protocol
+     * @param {boolean} options.disableLocalStorageSync - disables localStorage syncing (default: false)
+     * @param {string} options.diskJsCachePath - set to null to disable disk cache and use memory instead (disabled by default)
+     * @param {number} options.jsCacheSize - in bytes. default: 50mb
+     */
+    constructor({
+        loggerGetIP = (req) => req.socket.remoteAddress,
+        logger = new RammerheadLogging({ logLevel: 'disabled' }),
+        bindingAddress = '127.0.0.1',
+        port = 8080,
+        crossDomainPort = 8081,
+        dontListen = false,
+        ssl = null,
+        getServerInfo = (req) => {
+            const { hostname, port } = new URL('http://' + req.headers.host);
+            return {
+                hostname,
+                port,
+                protocol: req.socket.encrypted ? 'https:' : 'http:'
+            };
+        },
+        disableLocalStorageSync = false,
+        diskJsCachePath = null,
+        jsCacheSize = 50 * 1024 * 1024
+    } = {}) {
+        if (!crossDomainPort) {
+            const httpOrHttps = ssl ? https : http;
+            const proxyHttpOrHttps = http;
+            const originalProxyCreateServer = proxyHttpOrHttps.createServer;
+            const originalCreateServer = httpOrHttps.createServer; // handle recursion case if proxyHttpOrHttps and httpOrHttps are the same
+            let onlyOneHttpServer = null;
+
+            // a hack to force testcafe-hammerhead's proxy library into using only one http port.
+            // a downside to using only one proxy server is that crossdomain requests
+            // will not be simulated correctly
+            proxyHttpOrHttps.createServer = function (...args) {
+                const emptyFunc = () => {};
+                if (onlyOneHttpServer) {
+                    // createServer for server1 already called. now we return a mock http server for server2
+                    return { on: emptyFunc, listen: emptyFunc, close: emptyFunc };
+                }
+                if (args.length !== 2) throw new Error('unexpected argument length coming from hammerhead');
+                return (onlyOneHttpServer = originalCreateServer(...args));
+            };
+
+            // now, we force the server to listen to a specific port and a binding address, regardless of what
+            // hammerhead server.listen(anything)
+            const originalListen = http.Server.prototype.listen;
+            http.Server.prototype.listen = function (_proxyPort) {
+                if (dontListen) return;
+                originalListen.call(this, port, bindingAddress);
+            };
+
+            // actual proxy initialization
+            // the values don't matter (except for developmentMode), since we'll be rewriting serverInfo anyway
+            super('hostname', 'port', 'port', {
+                ssl,
+                developmentMode: true,
+                cache: true
+            });
+
+            // restore hooked functions to their original state
+            proxyHttpOrHttps.createServer = originalProxyCreateServer;
+            http.Server.prototype.listen = originalListen;
+        } else {
+            // just initialize the proxy as usual, since we don't need to do hacky stuff like the above.
+            // we still need to make sure the proxy binds to the correct address though
+            const originalListen = http.Server.prototype.listen;
+            http.Server.prototype.listen = function (portArg) {
+                if (dontListen) return;
+                originalListen.call(this, portArg, bindingAddress);
+            };
+            super('doesntmatter', port, crossDomainPort, {
+                ssl,
+                developmentMode: true,
+                cache: true
+            });
+            this.crossDomainPort = crossDomainPort;
+            http.Server.prototype.listen = originalListen;
+        }
+
+        this._setupRammerheadServiceRoutes();
+        this._setupLocalStorageServiceRoutes(disableLocalStorageSync);
+
+        this.onRequestPipeline = [];
+        this.onUpgradePipeline = [];
+        this.websocketRoutes = [];
+        this.rewriteServerHeaders = {
+            'permissions-policy': (headerValue) => headerValue && headerValue.replace(/sync-xhr/g, 'sync-yes'),
+            'feature-policy': (headerValue) => headerValue && headerValue.replace(/sync-xhr/g, 'sync-yes'),
+            'referrer-policy': () => 'no-referrer-when-downgrade',
+            'report-to': () => undefined,
+            'cross-origin-embedder-policy': () => undefined
+        };
+
+        this.getServerInfo = getServerInfo;
+        this.serverInfo1 = null; // make sure no one uses these serverInfo
+        this.serverInfo2 = null;
+
+        this.loggerGetIP = loggerGetIP;
+        this.logger = logger;
+
+        addJSDiskCache(diskJsCachePath, jsCacheSize);
+    }
+
+    // add WS routing
+    /**
+     * since we have .GET and .POST, why not add in a .WS also
+     * @param {string|RegExp} route - can be '/route/to/things' or /^\\/route\\/(this)|(that)\\/things$/
+     * @param {(ws: WebSocket, req: http.IncomingMessage) => WebSocket} handler - ws is the connection between the client and the server
+     * @param {object} websocketOptions - read https://www.npmjs.com/package/ws for a list of Websocket.Server options. Note that
+     * the { noServer: true } will always be applied
+     * @returns {WebSocket.Server}
+     */
+    WS(route, handler, websocketOptions = {}) {
+        if (this.checkIsRoute(route)) {
+            throw new TypeError('WS route already exists');
+        }
+
+        const wsServer = new WebSocket.Server({
+            ...websocketOptions,
+            noServer: true
+        });
+        this.websocketRoutes.push({ route, handler, wsServer });
+
+        return wsServer;
+    }
+    unregisterWS(route) {
+        if (!this.getWSRoute(route, true)) {
+            throw new TypeError('websocket route does not exist');
+        }
+    }
+    /**
+     * @param {string} path
+     * @returns {{ route: string|RegExp, handler: (ws: WebSocket, req: http.IncomingMessage) => WebSocket, wsServer: WebSocket.Server}|null}
+     */
+    getWSRoute(path, doDelete = false) {
+        for (let i = 0; i < this.websocketRoutes.length; i++) {
+            if (
+                (typeof this.websocketRoutes[i].route === 'string' && this.websocketRoutes[i].route === path) ||
+                (this.websocketRoutes[i] instanceof RegExp && this.websocketRoutes[i].route.test(path))
+            ) {
+                const route = this.websocketRoutes[i];
+                if (doDelete) {
+                    this.websocketRoutes.splice(i, 1);
+                    i--;
+                }
+                return route;
+            }
+        }
+        return null;
+    }
+    /**
+     * @private
+     */
+    _WSRouteHandler(req, socket, head) {
+        const route = this.getWSRoute(req.url);
+        if (route) {
+            // RH stands for rammerhead. RHROUTE is a custom implementation by rammerhead that is
+            // unrelated to hammerhead
+            this.logger.traffic(`WSROUTE UPGRADE ${this.loggerGetIP(req)} ${req.url}`);
+            route.wsServer.handleUpgrade(req, socket, head, (client, req) => {
+                this.logger.traffic(`WSROUTE OPEN ${this.loggerGetIP(req)} ${req.url}`);
+                client.once('close', () => {
+                    this.logger.traffic(`WSROUTE CLOSE ${this.loggerGetIP(req)} ${req.url}`);
+                });
+                route.handler(client, req);
+            });
+            return true;
+        }
+    }
+
+    // manage pipelines //
+    /**
+     * @param {(req: http.IncomingMessage,
+     *          res: http.ServerResponse,
+     *          serverInfo: ServerInfo,
+     *          isRoute: boolean,
+     *          isWebsocket: boolean) => Promise<boolean>} onRequest - return true to terminate handoff to proxy.
+     * There is an isWebsocket even though there is an onUpgrade pipeline already. This is because hammerhead
+     * processes the onUpgrade and then passes it directly to onRequest, but without the "head" Buffer argument.
+     * The onUpgrade pipeline is to solve that lack of the "head" argument issue in case one needs it.
+     * @param {boolean} beginning - whether to add it to the beginning of the pipeline
+     */
+    addToOnRequestPipeline(onRequest, beginning = false) {
+        if (beginning) {
+            this.onRequestPipeline.push(onRequest);
+        } else {
+            this.onRequestPipeline.unshift(onRequest);
+        }
+    }
+    /**
+     * @param {(req: http.IncomingMessage,
+     *          socket: stream.Duplex,
+     *          head: Buffer,
+     *          serverInfo: ServerInfo,
+     *          isRoute: boolean) => Promise<boolean>} onUpgrade - return true to terminate handoff to proxy
+     * @param {boolean} beginning - whether to add it to the beginning of the pipeline
+     */
+    addToOnUpgradePipeline(onUpgrade, beginning = false) {
+        if (beginning) {
+            this.onUpgradePipeline.push(onUpgrade);
+        } else {
+            this.onUpgradePipeline.unshift(onUpgrade);
+        }
+    }
+
+    // override hammerhead's proxy functions to use the pipeline //
+    checkIsRoute(req) {
+        if (req instanceof RegExp) {
+            return !!this.getWSRoute(req);
+        }
+        // code modified from
+        // https://github.com/DevExpress/testcafe-hammerhead/blob/879d6ae205bb711dfba8c1c88db635e8803b8840/src/proxy/router.ts#L95
+        const routerQuery = `${req.method} ${getPathname(req.url || '')}`;
+        const route = this.routes.get(routerQuery);
+        if (route) {
+            return true;
+        }
+        for (const routeWithParams of this.routesWithParams) {
+            const routeMatch = routerQuery.match(routeWithParams.re);
+            if (routeMatch) {
+                return true;
+            }
+        }
+        return !!this.getWSRoute(req.url);
+    }
+    /**
+     * @param {http.IncomingMessage} req
+     * @param {http.ServerResponse} res
+     * @param {ServerInfo} serverInfo
+     */
+    async _onRequest(req, res, serverInfo) {
+        serverInfo = this._rewriteServerInfo(req);
+
+        const isWebsocket = res instanceof stream.Duplex;
+
+        if (!isWebsocket) {
+            // strip server headers
+            const originalWriteHead = res.writeHead;
+            const self = this;
+            res.writeHead = function (statusCode, statusMessage, headers) {
+                if (!headers) {
+                    headers = statusMessage;
+                    statusMessage = undefined;
+                }
+
+                if (headers) {
+                    const alreadyRewrittenHeaders = [];
+                    if (Array.isArray(headers)) {
+                        // [content-type, text/html, headerKey, headerValue, ...]
+                        for (let i = 0; i < headers.length - 1; i += 2) {
+                            const header = headers[i].toLowerCase();
+                            if (header in self.rewriteServerHeaders) {
+                                alreadyRewrittenHeaders.push(header);
+                                headers[i + 1] =
+                                    self.rewriteServerHeaders[header] &&
+                                    self.rewriteServerHeaders[header](headers[i + 1]);
+                                if (!headers[i + 1]) {
+                                    headers.splice(i, 2);
+                                    i -= 2;
+                                }
+                            }
+                        }
+                        for (const header in self.rewriteServerHeaders) {
+                            if (alreadyRewrittenHeaders.includes(header)) continue;
+                            // if user wants to add headers, they can do that here
+                            const value = self.rewriteServerHeaders[header] && self.rewriteServerHeaders[header]();
+                            if (value) {
+                                headers.push(header, value);
+                            }
+                        }
+                    } else {
+                        for (const header in headers) {
+                            if (header in self.rewriteServerHeaders) {
+                                alreadyRewrittenHeaders.push(header);
+                                headers[header] =
+                                    self.rewriteServerHeaders[header] && self.rewriteServerHeaders[header]();
+                                if (!headers[header]) {
+                                    delete headers[header];
+                                }
+                            }
+                        }
+                        for (const header in self.rewriteServerHeaders) {
+                            if (alreadyRewrittenHeaders.includes(header)) continue;
+                            const value = self.rewriteServerHeaders[header] && self.rewriteServerHeaders[header]();
+                            if (value) {
+                                headers[header] = value;
+                            }
+                        }
+                    }
+                }
+
+                if (statusMessage) {
+                    originalWriteHead.call(this, statusCode, statusMessage, headers);
+                } else {
+                    originalWriteHead.call(this, statusCode, headers);
+                }
+            };
+        }
+
+        const isRoute = this.checkIsRoute(req);
+        const ip = this.loggerGetIP(req);
+
+        this.logger.traffic(`${isRoute ? 'ROUTE ' : ''}${ip} ${req.url}`);
+        for (const handler of this.onRequestPipeline) {
+            if ((await handler.call(this, req, res, serverInfo, isRoute, isWebsocket)) === true) {
+                return;
+            }
+        }
+        // hammerhead's routing does not support websockets. Allowing it
+        // will result in an error thrown
+        if (isRoute && isWebsocket) {
+            httpResponse.badRequest(this.logger, req, res, ip, 'Rejected unsupported websocket request');
+            return;
+        }
+        super._onRequest(req, res, serverInfo);
+    }
+    /**
+     * @param {http.IncomingMessage} req
+     * @param {stream.Duplex} socket
+     * @param {Buffer} head
+     * @param {ServerInfo} serverInfo
+     */
+    async _onUpgradeRequest(req, socket, head, serverInfo) {
+        serverInfo = this._rewriteServerInfo(req);
+        for (const handler of this.onUpgradePipeline) {
+            const isRoute = this.checkIsRoute(req);
+            if ((await handler.call(this, req, socket, head, serverInfo, isRoute)) === true) {
+                return;
+            }
+        }
+        if (this._WSRouteHandler(req, socket, head)) return;
+        super._onUpgradeRequest(req, socket, head, serverInfo);
+    }
+
+    /**
+     * @private
+     * @param {http.IncomingMessage} req
+     * @returns {ServerInfo}
+     */
+    _rewriteServerInfo(req) {
+        const serverInfo = this.getServerInfo(req);
+        return {
+            hostname: serverInfo.hostname,
+            port: serverInfo.port,
+            crossDomainPort: serverInfo.crossDomainPort || this.crossDomainPort || serverInfo.port,
+            protocol: serverInfo.protocol,
+            domain: `${serverInfo.protocol}//${serverInfo.hostname}:${serverInfo.port}`,
+            cacheRequests: false
+        };
+    }
+    /**
+     * @private
+     */
+    _setupRammerheadServiceRoutes() {
+        this.GET('/rammerhead.js', {
+            content: fs.readFileSync(
+                path.join(__dirname, '../client/rammerhead' + (process.env.DEVELOPMENT ? '.js' : '.min.js'))
+            ),
+            contentType: 'application/x-javascript'
+        });
+        this.GET('/api/shuffleDict', (req, res) => {
+            const { id } = new URLPath(req.url).getParams();
+            if (!id || !this.openSessions.has(id)) {
+                return httpResponse.badRequest(this.logger, req, res, this.loggerGetIP(req), 'Invalid session id');
+            }
+            res.end(JSON.stringify(this.openSessions.get(id).shuffleDict) || '');
+        });
+    }
+    /**
+     * @private
+     */
+    _setupLocalStorageServiceRoutes(disableSync) {
+        this.POST('/syncLocalStorage', async (req, res) => {
+            if (disableSync) {
+                res.writeHead(404);
+                res.end('server disabled localStorage sync');
+                return;
+            }
+            const badRequest = (msg) => httpResponse.badRequest(this.logger, req, res, this.loggerGetIP(req), msg);
+            const respondJson = (obj) => res.end(JSON.stringify(obj));
+            const { sessionId, origin } = new URLPath(req.url).getParams();
+
+            if (!sessionId || !this.openSessions.has(sessionId)) {
+                return badRequest('Invalid session id');
+            }
+            if (!origin) {
+                return badRequest('Invalid origin');
+            }
+
+            let parsed;
+            try {
+                parsed = JSON.parse(await streamToString(req));
+            } catch (e) {
+                return badRequest('bad client body');
+            }
+
+            const now = Date.now();
+            const session = this.openSessions.get(sessionId, false);
+            if (!session.data.localStorage) session.data.localStorage = {};
+
+            switch (parsed.type) {
+                case 'sync':
+                    if (parsed.fetch) {
+                        // client is syncing for the first time
+                        if (!session.data.localStorage[origin]) {
+                            // server does not have any data on origin, so create an empty record
+                            // and send an empty object back
+                            session.data.localStorage[origin] = { data: {}, timestamp: now };
+                            return respondJson({
+                                timestamp: now,
+                                data: {}
+                            });
+                        } else {
+                            // server does have data, so send data back
+                            return respondJson({
+                                timestamp: session.data.localStorage[origin].timestamp,
+                                data: session.data.localStorage[origin].data
+                            });
+                        }
+                    } else {
+                        // sync server and client localStorage
+
+                        parsed.timestamp = parseInt(parsed.timestamp);
+                        if (isNaN(parsed.timestamp)) return badRequest('must specify valid timestamp');
+                        if (parsed.timestamp > now) return badRequest('cannot specify timestamp in the future');
+                        if (!parsed.data || typeof parsed.data !== 'object')
+                            return badRequest('data must be an object');
+
+                        for (const prop in parsed.data) {
+                            if (typeof parsed.data[prop] !== 'string') {
+                                return badRequest('data[prop] must be a string');
+                            }
+                        }
+
+                        if (!session.data.localStorage[origin]) {
+                            // server does not have data, so use client's
+                            session.data.localStorage[origin] = { data: parsed.data, timestamp: now };
+                            return respondJson({});
+                        } else if (session.data.localStorage[origin].timestamp <= parsed.timestamp) {
+                            // server data is either the same as client or outdated, but we
+                            // sync even if timestamps are the same in case the client changed the localStorage
+                            // without updating
+                            session.data.localStorage[origin].data = parsed.data;
+                            session.data.localStorage[origin].timestamp = parsed.timestamp;
+                            return respondJson({});
+                        } else {
+                            // client data is stale
+                            return respondJson({
+                                timestamp: session.data.localStorage[origin].timestamp,
+                                data: session.data.localStorage[origin].data
+                            });
+                        }
+                    }
+                case 'update':
+                    if (!session.data.localStorage[origin])
+                        return badRequest('must perform sync first on a new origin');
+                    if (!parsed.updateData || typeof parsed.updateData !== 'object')
+                        return badRequest('updateData must be an object');
+                    for (const prop in parsed.updateData) {
+                        if (!parsed.updateData[prop] || typeof parsed.updateData[prop] !== 'string')
+                            return badRequest('updateData[prop] must be a non-empty string');
+                    }
+                    for (const prop in parsed.updateData) {
+                        session.data.localStorage[origin].data[prop] = parsed.updateData[prop];
+                    }
+                    session.data.localStorage[origin].timestamp = now;
+                    return respondJson({
+                        timestamp: now
+                    });
+                default:
+                    return badRequest('unknown type ' + parsed.type);
+            }
+        });
+    }
+
+    openSession() {
+        throw new TypeError('unimplemented. please use a RammerheadSessionStore and use their .add() method');
+    }
+    close() {
+        super.close();
+        this.openSessions.close();
+    }
+
+    /**
+     * @param {string} route
+     * @param {StaticContent | (req: http.IncomingMessage, res: http.ServerResponse) => void} handler
+     */
+    GET(route, handler) {
+        if (route === '/hammerhead.js') {
+            handler.content = fs.readFileSync(
+                path.join(__dirname, '../client/hammerhead' + (process.env.DEVELOPMENT ? '.js' : '.min.js'))
+            );
+        }
+        super.GET(route, handler);
+    }
+
+    // the following is to fix hamerhead's typescript definitions
+    /**
+     * @param {string} route
+     * @param {StaticContent | (req: http.IncomingMessage, res: http.ServerResponse) => void} handler
+     */
+    POST(route, handler) {
+        super.POST(route, handler);
+    }
+}
+
+module.exports = RammerheadProxy;
+RammerheadSession.js
+const { Session } = require('testcafe-hammerhead');
+const UploadStorage = require('testcafe-hammerhead/lib/upload/storage');
+const generateId = require('../util/generateId');
+const StrShuffler = require('../util/StrShuffler');
+
+// disable UploadStorage, a testcafe testing feature we do not need
+const emptyFunc = () => {};
+UploadStorage.prototype.copy = emptyFunc;
+UploadStorage.prototype.get = emptyFunc;
+UploadStorage.prototype.store = emptyFunc;
+
+/**
+ * wrapper for initializing Session with saving capabilities
+ */
+class RammerheadSession extends Session {
+    data = {};
+    createdAt = Date.now();
+    lastUsed = Date.now();
+
+    /**
+     * @param {object} options
+     * @param {string} options.id
+     * @param {boolean} options.dontConnectToData - used when we want to connect to data later (or simply don't want to)
+     * @param {boolean} options.disableShuffling
+     * @param {string[]} options.prependScripts
+     */
+    constructor({ id = generateId(), dontConnectToData = false, disableShuffling = false, prependScripts = [] } = {}) {
+        super(['blah/blah'], {
+            allowMultipleWindows: true,
+            disablePageCaching: false
+        });
+
+        // necessary abstract methods for Session
+        this.getIframePayloadScript = async () => '';
+        this.getPayloadScript = async () => '';
+        this.getAuthCredentials = () => ({});
+        this.handleFileDownload = () => void 0;
+        this.handlePageError = () => void 0;
+        this.handleAttachment = () => void 0;
+        // this.handlePageError = (ctx, err) => {
+        //     console.error(ctx.req.url);
+        //     console.error(err);
+        // };
+
+        // intellisense //
+        /**
+         * @type {{ host: string, hostname: string, bypassRules?: string[]; port?: string; proxyAuth?: string, authHeader?: string } | null}
+         */
+        this.externalProxySettings = null;
+
+        // disable http2. error handling from http2 proxy client to non-http2 user is too complicated to handle
+        // (status code 0, for example, will crash rammerhead)
+        this.isHttp2Disabled = () => true;
+
+        this.injectable.scripts.push(...prependScripts);
+        this.injectable.scripts.push('/rammerhead.js');
+
+        this.id = id;
+        this.shuffleDict = disableShuffling ? null : StrShuffler.generateDictionary();
+        if (!dontConnectToData) {
+            this.connectHammerheadToData();
+        }
+    }
+    /**
+     * @param {boolean} dontCookie - set this to true if the store is using a more reliable approach to
+     * saving the cookies (like in serializeSession)
+     */
+    connectHammerheadToData(dontCookie = false) {
+        this._connectObjectToHook(this, 'createdAt');
+        this._connectObjectToHook(this, 'lastUsed');
+        this._connectObjectToHook(this, 'injectable');
+        this._connectObjectToHook(this, 'externalProxySettings');
+        this._connectObjectToHook(this, 'shuffleDict');
+        if (!dontCookie) this._connectObjectToHook(this.cookies._cookieJar.store, 'idx', 'cookies');
+    }
+
+    updateLastUsed() {
+        this.lastUsed = Date.now();
+    }
+    serializeSession() {
+        return JSON.stringify({
+            data: this.data,
+            serializedCookieJar: this.cookies.serializeJar()
+        });
+    }
+    // hook system and serializing are for two different store systems
+    static DeserializeSession(id, serializedSession) {
+        const parsed = JSON.parse(serializedSession);
+        if (!parsed.data) throw new Error('expected serializedSession to contain data object');
+        if (!parsed.serializedCookieJar)
+            throw new Error('expected serializedSession to contain serializedCookieJar object');
+
+        const session = new RammerheadSession({ id, dontConnectToData: true });
+        session.data = parsed.data;
+        session.connectHammerheadToData(true);
+        session.cookies.setJar(parsed.serializedCookieJar);
+        return session;
+    }
+
+    hasRequestEventListeners() {
+        // force forceProxySrcForImage to be true
+        // see https://github.com/DevExpress/testcafe-hammerhead/blob/a9fbf7746ff347f7bdafe1f80cf7135eeac21e34/src/session/index.ts#L180
+        return true;
+    }
+    /**
+     * @private
+     */
+    _connectObjectToHook(obj, prop, dataProp = prop) {
+        const originalValue = obj[prop];
+        Object.defineProperty(obj, prop, {
+            get: () => this.data[dataProp],
+            set: (value) => {
+                this.data[dataProp] = value;
+            }
+        });
+        if (!(dataProp in this.data)) {
+            this.data[dataProp] = originalValue;
+        }
+    }
+}
+
+module.exports = RammerheadSession;
+RammerheadSessionAbstract.js
+/* eslint-disable no-unused-vars */
+
+/**
+ * @private
+ * @typedef {import("./RammerheadSession")} RammerheadSession
+ */
+
+/**
+ * this is the minimum in order to have a fully working versatile session store. Though it is an abstract
+ * class and should be treated as such, it includes default functions deemed necessary that are not
+ * particular to different implementations
+ * @abstract
+ */
+class RammerheadSessionAbstractStore {
+    constructor() {
+        if (this.constructor === RammerheadSessionAbstractStore) {
+            throw new Error('abstract classes cannot be instantiated');
+        }
+    }
+
+    /**
+     *
+     * @param {import('./RammerheadProxy')} proxy - this will overwrite proxy.openSessions with this class instance and
+     * adds a request handler that calls loadSessionToMemory
+     * @param {boolean} removeExistingSessions - whether to remove all sessions before overwriting proxy.openSessions
+     */
+    attachToProxy(proxy, removeExistingSessions = true) {
+        if (proxy.openSessions === this) throw new TypeError('already attached to proxy');
+
+        if (removeExistingSessions) {
+            for (const [, session] of proxy.openSessions.entries()) {
+                proxy.closeSession(session);
+            }
+        }
+        proxy.openSessions = this;
+    }
+
+    /**
+     * @private
+     */
+    _mustImplement() {
+        throw new Error('must be implemented');
+    }
+
+    /**
+     * @abstract
+     * @returns {string[]} - list of session ids in store
+     */
+    keys() {
+        this._mustImplement();
+    }
+    /**
+     * @abstract
+     * @param {string} id
+     * @returns {boolean}
+     */
+    has(id) {
+        this._mustImplement();
+    }
+    /**
+     * @abstract
+     * @param {string} id
+     * @param {boolean} updateActiveTimestamp
+     * @returns {RammerheadSession|undefined}
+     */
+    get(id, updateActiveTimestamp = true) {
+        this._mustImplement();
+    }
+    /**
+     * the implemented method here will use the dataOperation option in RammerheadSession however they
+     * see fit
+     * @abstract
+     * @param {string} id
+     * @returns {RammerheadSession}
+     */
+    add(id) {
+        this._mustImplement();
+    }
+    /**
+     * @abstract
+     * @param {string} id
+     * @returns {boolean} - returns true when a delete operation is performed
+     */
+    delete(id) {
+        this._mustImplement();
+    }
+    /**
+     * @abstract
+     * @param {string} id
+     * @param {string} serializedSession
+     */
+    addSerializedSession(id, serializedSession) {
+        this._mustImplement();
+    }
+    /**
+     * optional abstract method
+     */
+    close() {}
+}
+
+module.exports = RammerheadSessionAbstractStore;
+RammerheadSessionFileCache.js
+const fs = require('fs');
+const path = require('path');
+const RammerheadSessionAbstractStore = require('./RammerheadSessionAbstractStore');
+const RammerheadSession = require('./RammerheadSession');
+const RammerheadLogging = require('../classes/RammerheadLogging');
+
+// rh = rammerhead. extra f to distinguish between rhsession (folder) and rhfsession (file)
+const sessionFileExtension = '.rhfsession';
+
+class RammerheadSessionFileCache extends RammerheadSessionAbstractStore {
+    /**
+     *
+     * @param {object} options
+     * @param {string} options.saveDirectory - all cacheTimeouted sessions will be saved in this folder
+     * to avoid storing all the sessions in the memory.
+     * @param {RammerheadLogging|undefined} options.logger
+     * @param {number} options.cacheTimeout - timeout before saving cache to disk and deleting it from the cache
+     * @param {number} options.cacheCheckInterval
+     * @param {boolean} options.deleteUnused - (default: true) if set to true, it deletes unused sessions when saving cache to disk
+     * @param {boolean} options.deleteCorruptedSessions - (default: true) if set to true, auto-deletes session files that
+     * give a parse error (happens when nodejs exits abruptly while serializing session to disk)
+     * @param {object|null} options.staleCleanupOptions - set to null to disable cleaning up stale sessions
+     * @param {number|null} options.staleCleanupOptions.staleTimeout - stale sessions that are inside saveDirectory that go over
+     * this timeout will be deleted. Set to null to disable.
+     * @param {number|null} options.staleCleanupOptions.maxToLive - any created sessions that are older than this will be deleted no matter the usage.
+     * Set to null to disable.
+     * @param {number} options.staleCleanupOptions.staleCheckInterval
+     */
+    constructor({
+        saveDirectory = path.join(__dirname, '../../sessions'),
+        logger = new RammerheadLogging({ logLevel: 'disabled' }),
+        cacheTimeout = 1000 * 60 * 20, // 20 minutes
+        cacheCheckInterval = 1000 * 60 * 10, // 10 minutes,
+        deleteUnused = true,
+        deleteCorruptedSessions = true,
+        staleCleanupOptions = {
+            staleTimeout: 1000 * 60 * 60 * 24 * 1, // 1 day
+            maxToLive: 1000 * 60 * 60 * 24 * 4, // four days
+            staleCheckInterval: 1000 * 60 * 60 * 1 // 1 hour
+        }
+    } = {}) {
+        super();
+        this.saveDirectory = saveDirectory;
+        this.logger = logger;
+        this.deleteUnused = deleteUnused;
+        this.cacheTimeout = cacheTimeout;
+        this.deleteCorruptedSessions = deleteCorruptedSessions;
+        /**
+         * @type {Map.<string, RammerheadSession>}
+         */
+        this.cachedSessions = new Map();
+        setInterval(() => this._saveCacheToDisk(), cacheCheckInterval).unref();
+        if (staleCleanupOptions) {
+            this._removeStaleSessions(staleCleanupOptions.staleTimeout, staleCleanupOptions.maxToLive);
+            setInterval(
+                () => this._removeStaleSessions(staleCleanupOptions.staleTimeout, staleCleanupOptions.maxToLive),
+                staleCleanupOptions.staleCheckInterval
+            ).unref();
+        }
+    }
+
+    keysStore() {
+        return fs
+            .readdirSync(this.saveDirectory)
+            .filter((file) => file.endsWith(sessionFileExtension))
+            .map((file) => file.slice(0, -sessionFileExtension.length));
+    }
+    /**
+     * @returns {string[]} - list of session ids in store
+     */
+    keys() {
+        let arr = this.keysStore();
+        for (const id of this.cachedSessions.keys()) {
+            if (!arr.includes(id)) arr.push(id);
+        }
+        return arr;
+    }
+    /**
+     * @param {string} id
+     * @returns {boolean}
+     */
+    has(id) {
+        return this.cachedSessions.has(id) || fs.existsSync(this._getSessionFilePath(id));
+    }
+    /**
+     * @param {string} id
+     * @param {boolean} updateActiveTimestamp
+     * @returns {RammerheadSession|undefined}
+     */
+    get(id, updateActiveTimestamp = true, cacheToMemory = true) {
+        if (!this.has(id)) {
+            this.logger.debug(`(FileCache.get) ${id} does not exist`);
+            return;
+        }
+
+        this.logger.debug(`(FileCache.get) ${id}`);
+        if (this.cachedSessions.has(id)) {
+            this.logger.debug(`(FileCache.get) returning memory cached session ${id}`);
+            return this.cachedSessions.get(id);
+        }
+
+        let session;
+        try {
+            session = RammerheadSession.DeserializeSession(id, fs.readFileSync(this._getSessionFilePath(id)));
+        } catch (e) {
+            if (e.name === 'SyntaxError' && e.message.includes('JSON')) {
+                this.logger.warn(`(FileCache.get) ${id} bad JSON`);
+                if (this.deleteCorruptedSessions) {
+                    this.delete(id);
+                    this.logger.warn(`(FileCache.get) ${id} deleted because of bad JSON`);
+            }
+                return;
+            }
+        }
+
+        if (updateActiveTimestamp) {
+            this.logger.debug(`(FileCache.get) ${id} update active timestamp`);
+            session.updateLastUsed();
+        }
+
+        if (cacheToMemory) {
+            this.cachedSessions.set(id, session);
+            this.logger.debug(`(FileCache.get) saved ${id} into cache memory`);
+        }
+
+        return session;
+    }
+    /**
+     * @param {string} id
+     * @returns {RammerheadSession}
+     */
+    add(id) {
+        if (this.has(id)) throw new Error(`session ${id} already exists`);
+
+        fs.writeFileSync(this._getSessionFilePath(id), new RammerheadSession().serializeSession());
+
+        this.logger.debug(`FileCache.add ${id}`);
+
+        return this.get(id);
+    }
+    /**
+     * @param {string} id
+     * @returns {boolean} - returns true when a delete operation is performed
+     */
+    delete(id) {
+        this.logger.debug(`(FileCache.delete) deleting ${id}`);
+        if (this.has(id)) {
+            fs.unlinkSync(this._getSessionFilePath(id));
+            this.cachedSessions.delete(id);
+            this.logger.debug(`(FileCache.delete) deleted ${id}`);
+            return true;
+        }
+        this.logger.debug(`(FileCache.delete) ${id} does not exist`);
+        return false;
+    }
+    /**
+     * @param {string} id
+     * @param {string} serializedSession
+     */
+    addSerializedSession(id, serializedSession) {
+        this.logger.debug(`(FileCache.addSerializedSession) adding serialized session id ${id} to store`);
+        const session = RammerheadSession.DeserializeSession(id, serializedSession);
+        fs.writeFileSync(this._getSessionFilePath(id), session.serializeSession());
+        this.logger.debug(`(FileCache.addSerializedSession) added ${id} to cache`);
+    }
+    close() {
+        this.logger.debug(`(FileCache.close) calling _saveCacheToDisk`);
+        this._saveCacheToDisk(true);
+    }
+
+    /**
+     * @private
+     * @param {string} id
+     * @returns {string} - generated file path to session
+     */
+    _getSessionFilePath(id) {
+        return path.join(this.saveDirectory, id.replace(/\/|\\/g, '') + sessionFileExtension);
+    }
+    /**
+     * @private
+     * @param {number|null} staleTimeout
+     * @param {number|null} maxToLive
+     */
+    _removeStaleSessions(staleTimeout, maxToLive) {
+        const sessionIds = this.keysStore();
+        let deleteCount = 0;
+        this.logger.debug(`(FileCache._removeStaleSessions) Need to go through ${sessionIds.length} sessions in store`);
+
+        const now = Date.now();
+        for (const id of sessionIds) {
+            const session = this.get(id, false, false);
+            if (!session) {
+                this.logger.debug(`(FileCache._removeStaleSessions) skipping ${id} as .get() returned undefined`);
+                continue;
+            }
+            if (
+                (staleTimeout && now - session.lastUsed > staleTimeout) ||
+                (maxToLive && now - session.createdAt > maxToLive)
+            ) {
+                this.delete(id);
+                deleteCount++;
+                this.logger.debug(`(FileCache._removeStaleSessions) deleted ${id}`);
+            }
+        }
+
+        this.logger.debug(`(FileCache._removeStaleSessions) Deleted ${deleteCount} sessions from store`);
+    }
+    /**
+     * @private
+     */
+    _saveCacheToDisk(forceSave) {
+        let deleteCount = 0;
+        this.logger.debug(`(FileCache._saveCacheToDisk) need to go through ${this.cachedSessions.size} sessions`);
+
+        const now = Date.now();
+        for (const [sessionId, session] of this.cachedSessions) {
+            if (forceSave || now - session.lastUsed > this.cacheTimeout) {
+                if (session.lastUsed === session.createdAt && this.deleteUnused) {
+                    this.cachedSessions.delete(sessionId);
+                    deleteCount++;
+                    this.logger.debug(`(FileCache._saveCacheToDisk) deleted unused ${sessionId} from memory`);
+                } else {
+                    fs.writeFileSync(this._getSessionFilePath(sessionId), session.serializeSession());
+                    this.cachedSessions.delete(sessionId);
+                    deleteCount++;
+                    this.logger.debug(
+                        `(FileCache._saveCacheToDisk) removed ${sessionId} from memory and saved to store`
+                    );
+                }
+            }
+        }
+
+        this.logger.debug(`(FileCache._saveCacheToDisk) Removed ${deleteCount} sessions from memory`);
+    }
+}
+
+module.exports = RammerheadSessionFileCache;
+Rammerhead.js
+(function () {
+    var hammerhead = window['%hammerhead%'];
+    if (!hammerhead) throw new Error('hammerhead not loaded yet');
+    if (hammerhead.settings._settings.sessionId) {
+        // task.js already loaded. this will likely never happen though since this file loads before task.js
+        console.warn('unexpected task.js to load before rammerhead.js. url shuffling cannot be used');
+        main();
+    } else {
+        // wait for task.js to load
+        hookHammerheadStartOnce(main);
+        // before task.js, we need to add url shuffling
+        addUrlShuffling();
+    }
+
+    function main() {
+        fixUrlRewrite();
+        fixElementGetter();
+        fixCrossWindowLocalStorage();
+
+        delete window.overrideGetProxyUrl;
+        delete window.overrideParseProxyUrl;
+        delete window.overrideIsCrossDomainWindows;
+
+        // other code if they want to also hook onto hammerhead start //
+        if (window.rammerheadStartListeners) {
+            for (const eachListener of window.rammerheadStartListeners) {
+                try {
+                    eachListener();
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+            delete window.rammerheadStartListeners;
+        }
+
+        // sync localStorage code //
+        // disable if other code wants to implement their own localStorage site wrapper
+        if (window.rammerheadDisableLocalStorageImplementation) {
+            delete window.rammerheadDisableLocalStorageImplementation;
+            return;
+        }
+        // consts
+        var timestampKey = 'rammerhead_synctimestamp';
+        var updateInterval = 5000;
+        var isSyncing = false;
+
+        var proxiedLocalStorage = localStorage;
+        var realLocalStorage = proxiedLocalStorage.internal.nativeStorage;
+        var sessionId = hammerhead.settings._settings.sessionId;
+        var origin = window.__get$(window, 'location').origin;
+        var keyChanges = [];
+
+        try {
+            syncLocalStorage();
+        } catch (e) {
+            if (e.message !== 'server wants to disable localStorage syncing') {
+                throw e;
+            }
+            return;
+        }
+        proxiedLocalStorage.addChangeEventListener(function (event) {
+            if (isSyncing) return;
+            if (keyChanges.indexOf(event.key) === -1) keyChanges.push(event.key);
+        });
+        setInterval(function () {
+            var update = compileUpdate();
+            if (!update) return;
+            localStorageRequest({ type: 'update', updateData: update }, function (data) {
+                updateTimestamp(data.timestamp);
+            });
+
+            keyChanges = [];
+        }, updateInterval);
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'hidden') {
+                var update = compileUpdate();
+                if (update) {
+                    // even though we'll never get the timestamp, it's fine. this way,
+                    // the data is safer
+                    hammerhead.nativeMethods.sendBeacon.call(
+                        window.navigator,
+                        getSyncStorageEndpoint(),
+                        JSON.stringify({
+                            type: 'update',
+                            updateData: update
+                        })
+                    );
+                }
+            }
+        });
+
+        function syncLocalStorage() {
+            isSyncing = true;
+            var timestamp = getTimestamp();
+            var response;
+            if (!timestamp) {
+                // first time syncing
+                response = localStorageRequest({ type: 'sync', fetch: true });
+                if (response.timestamp) {
+                    updateTimestamp(response.timestamp);
+                    overwriteLocalStorage(response.data);
+                }
+            } else {
+                // resync
+                response = localStorageRequest({ type: 'sync', timestamp: timestamp, data: proxiedLocalStorage });
+                if (response.timestamp) {
+                    updateTimestamp(response.timestamp);
+                    overwriteLocalStorage(response.data);
+                }
+            }
+            isSyncing = false;
+
+            function overwriteLocalStorage(data) {
+                if (!data || typeof data !== 'object') throw new TypeError('data must be an object');
+                proxiedLocalStorage.clear();
+                for (var prop in data) {
+                    proxiedLocalStorage[prop] = data[prop];
+                }
+            }
+        }
+        function updateTimestamp(timestamp) {
+            if (!timestamp) throw new TypeError('timestamp must be defined');
+            if (isNaN(parseInt(timestamp))) throw new TypeError('timestamp must be a number. received' + timestamp);
+            realLocalStorage[timestampKey] = timestamp;
+        }
+        function getTimestamp() {
+            var rawTimestamp = realLocalStorage[timestampKey];
+            var timestamp = parseInt(rawTimestamp);
+            if (isNaN(timestamp)) {
+                if (rawTimestamp) {
+                    console.warn('invalid timestamp retrieved from storage: ' + rawTimestamp);
+                }
+                return null;
+            }
+            return timestamp;
+        }
+        function getSyncStorageEndpoint() {
+            return (
+                '/syncLocalStorage?sessionId=' + encodeURIComponent(sessionId) + '&origin=' + encodeURIComponent(origin)
+            );
+        }
+        function localStorageRequest(data, callback) {
+            if (!data || typeof data !== 'object') throw new TypeError('data must be an object');
+
+            var request = hammerhead.createNativeXHR();
+            // make synchronous if there is no callback
+            request.open('POST', getSyncStorageEndpoint(), !!callback);
+            request.setRequestHeader('content-type', 'application/json');
+            request.send(JSON.stringify(data));
+            function check() {
+                if (request.status === 404) {
+                    throw new Error('server wants to disable localStorage syncing');
+                }
+                if (request.status !== 200)
+                    throw new Error(
+                        'server sent a non 200 code. got ' + request.status + '. Response: ' + request.responseText
+                    );
+            }
+            if (!callback) {
+                check();
+                return JSON.parse(request.responseText);
+            } else {
+                request.onload = function () {
+                    check();
+                    callback(JSON.parse(request.responseText));
+                };
+            }
+        }
+        function compileUpdate() {
+            if (!keyChanges.length) return null;
+
+            var updates = {};
+            for (var i = 0; i < keyChanges.length; i++) {
+                updates[keyChanges[i]] = proxiedLocalStorage[keyChanges[i]];
+            }
+
+            keyChanges = [];
+            return updates;
+        }
+    }
+
+    var noShuffling = false;
+    function addUrlShuffling() {
+        const request = new XMLHttpRequest();
+        const sessionId = (location.pathname.slice(1).match(/^[a-z0-9]+/i) || [])[0];
+        if (!sessionId) {
+            console.warn('cannot get session id from url');
+            return;
+        }
+        request.open('GET', '/api/shuffleDict?id=' + sessionId, false);
+        request.send();
+        if (request.status !== 200) {
+            console.warn(
+                `received a non 200 status code while trying to fetch shuffleDict:\nstatus: ${request.status}\nresponse: ${request.responseText}`
+            );
+            return;
+        }
+        const shuffleDict = JSON.parse(request.responseText);
+        if (!shuffleDict) return;
+
+        // pasting entire thing here "because lazy" - m28
+        const mod = (n, m) => ((n % m) + m) % m;
+        const baseDictionary = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz~-';
+        const shuffledIndicator = '_rhs';
+        const generateDictionary = function () {
+            let str = '';
+            const split = baseDictionary.split('');
+            while (split.length > 0) {
+                str += split.splice(Math.floor(Math.random() * split.length), 1)[0];
+            }
+            return str;
+        };
+        class StrShuffler {
+            constructor(dictionary = generateDictionary()) {
+                this.dictionary = dictionary;
+            }
+            shuffle(str) {
+                if (str.startsWith(shuffledIndicator)) {
+                    return str;
+                }
+                let shuffledStr = '';
+                for (let i = 0; i < str.length; i++) {
+                    const char = str.charAt(i);
+                    const idx = baseDictionary.indexOf(char);
+                    if (char === '%' && str.length - i >= 3) {
+                        shuffledStr += char;
+                        shuffledStr += str.charAt(++i);
+                        shuffledStr += str.charAt(++i);
+                    } else if (idx === -1) {
+                        shuffledStr += char;
+                    } else {
+                        shuffledStr += this.dictionary.charAt(mod(idx + i, baseDictionary.length));
+                    }
+                }
+                return shuffledIndicator + shuffledStr;
+            }
+            unshuffle(str) {
+                if (!str.startsWith(shuffledIndicator)) {
+                    return str;
+                }
+
+                str = str.slice(shuffledIndicator.length);
+
+                let unshuffledStr = '';
+                for (let i = 0; i < str.length; i++) {
+                    const char = str.charAt(i);
+                    const idx = this.dictionary.indexOf(char);
+                    if (char === '%' && str.length - i >= 3) {
+                        unshuffledStr += char;
+                        unshuffledStr += str.charAt(++i);
+                        unshuffledStr += str.charAt(++i);
+                    } else if (idx === -1) {
+                        unshuffledStr += char;
+                    } else {
+                        unshuffledStr += baseDictionary.charAt(mod(idx - i, baseDictionary.length));
+                    }
+                }
+                return unshuffledStr;
+            }
+        }
+
+        const replaceUrl = (url, replacer) => {
+            //        regex:              https://google.com/    sessionid/   url
+            return (url || '').replace(/^((?:[a-z0-9]+:\/\/[^/]+)?(?:\/[^/]+\/))([^]+)/i, function (_, g1, g2) {
+                return g1 + replacer(g2);
+            });
+        };
+        const shuffler = new StrShuffler(shuffleDict);
+
+        // shuffle current url if it isn't already shuffled (unshuffled urls likely come from user input)
+        const oldUrl = location.href;
+        const newUrl = replaceUrl(location.href, (url) => shuffler.shuffle(url));
+        if (oldUrl !== newUrl) {
+            history.replaceState(null, null, newUrl);
+        }
+
+        const getProxyUrl = hammerhead.utils.url.getProxyUrl;
+        const parseProxyUrl = hammerhead.utils.url.parseProxyUrl;
+        hammerhead.utils.url.overrideGetProxyUrl(function (url, opts) {
+            if (noShuffling) {
+                return getProxyUrl(url, opts);
+            }
+            return replaceUrl(getProxyUrl(url, opts), (u) => shuffler.shuffle(u), true);
+        });
+        hammerhead.utils.url.overrideParseProxyUrl(function (url) {
+            return parseProxyUrl(replaceUrl(url, (u) => shuffler.unshuffle(u), false));
+        });
+        // manual hooks //
+        window.overrideGetProxyUrl(
+            (getProxyUrl$1) =>
+                function (url, opts) {
+                    if (noShuffling) {
+                        return getProxyUrl$1(url, opts);
+                    }
+                    return replaceUrl(getProxyUrl$1(url, opts), (u) => shuffler.shuffle(u), true);
+                }
+        );
+        window.overrideParseProxyUrl(
+            (parseProxyUrl$1) =>
+                function (url) {
+                    return parseProxyUrl$1(replaceUrl(url, (u) => shuffler.unshuffle(u), false));
+                }
+        );
+    }
+    function fixUrlRewrite() {
+        const port = location.port || (location.protocol === 'https:' ? '443' : '80');
+        const getProxyUrl = hammerhead.utils.url.getProxyUrl;
+        hammerhead.utils.url.overrideGetProxyUrl(function (url, opts = {}) {
+            if (!opts.proxyPort) {
+                opts.proxyPort = port;
+            }
+            return getProxyUrl(url, opts);
+        });
+        window.overrideParseProxyUrl(
+            (parseProxyUrl$1) =>
+                function (url) {
+                    const parsed = parseProxyUrl$1(url);
+                    if (!parsed || !parsed.proxy) return parsed;
+                    if (!parsed.proxy.port) {
+                        parsed.proxy.port = port;
+                    }
+                    return parsed;
+                }
+        );
+    }
+    function fixElementGetter() {
+        const fixList = {
+            HTMLAnchorElement: ['href'],
+            HTMLAreaElement: ['href'],
+            HTMLBaseElement: ['href'],
+            HTMLEmbedElement: ['src'],
+            HTMLFormElement: ['action'],
+            HTMLFrameElement: ['src'],
+            HTMLIFrameElement: ['src'],
+            HTMLImageElement: ['src'],
+            HTMLInputElement: ['src'],
+            HTMLLinkElement: ['href'],
+            HTMLMediaElement: ['src'],
+            HTMLModElement: ['cite'],
+            HTMLObjectElement: ['data'],
+            HTMLQuoteElement: ['cite'],
+            HTMLScriptElement: ['src'],
+            HTMLSourceElement: ['src'],
+            HTMLTrackElement: ['src']
+        };
+        const urlRewrite = (url) => (hammerhead.utils.url.parseProxyUrl(url) || {}).destUrl || url;
+        for (const ElementClass in fixList) {
+            for (const attr of fixList[ElementClass]) {
+                if (!window[ElementClass]) {
+                    console.warn('unexpected unsupported element class ' + ElementClass);
+                    continue;
+                }
+                const desc = Object.getOwnPropertyDescriptor(window[ElementClass].prototype, attr);
+                const originalGet = desc.get;
+                desc.get = function () {
+                    return urlRewrite(originalGet.call(this));
+                };
+                if (attr === 'action') {
+                    const originalSet = desc.set;
+                    // don't shuffle form action urls
+                    desc.set = function (value) {
+                        noShuffling = true;
+                        try {
+                            var returnVal = originalSet.call(this, value);
+                        } catch (e) {
+                            noShuffling = false;
+                            throw e;
+                        }
+                        noShuffling = false;
+                        return returnVal;
+                    };
+                }
+                Object.defineProperty(window[ElementClass].prototype, attr, desc);
+            }
+        }
+    }
+    function fixCrossWindowLocalStorage() {
+        // completely replace hammerhead's implementation as restore() and save() on every
+        // call is just not viable (mainly memory issues as the garbage collector is sometimes not fast enough)
+
+        const prefix = `rammerhead|storage-wrapper|${hammerhead.settings._settings.sessionId}|${
+            window.__get$(window, 'location').host
+        }|`;
+        const toRealStorageKey = (key = '') => prefix + key;
+        const fromRealStorageKey = (key = '') => {
+            if (!key.startsWith(prefix)) return null;
+            return key.slice(prefix.length);
+        };
+
+        const replaceStorageInstance = (storageProp, realStorage) => {
+            const reservedProps = ['internal', 'clear', 'key', 'getItem', 'setItem', 'removeItem', 'length'];
+            Object.defineProperty(window, storageProp, {
+                // define a value-based instead of getter-based property, since with this localStorage implementation,
+                // we don't need to rely on sharing a single memory-based storage across frames, unlike hammerhead
+                configurable: true,
+                writable: true,
+                // still use window[storageProp] as basis to allow scripts to access localStorage.internal
+                value: new Proxy(window[storageProp], {
+                    get(target, prop, receiver) {
+                        if (reservedProps.includes(prop) && prop !== 'length') {
+                            return Reflect.get(target, prop, receiver);
+                        } else if (prop === 'length') {
+                            let len = 0;
+                            for (const [key] of Object.entries(realStorage)) {
+                                if (fromRealStorageKey(key)) len++;
+                            }
+                            return len;
+                        } else {
+                            return realStorage[toRealStorageKey(prop)];
+                        }
+                    },
+                    set(_, prop, value) {
+                        if (!reservedProps.includes(prop)) {
+                            realStorage[toRealStorageKey(prop)] = value;
+                        }
+                        return true;
+                    },
+                    deleteProperty(_, prop) {
+                        delete realStorage[toRealStorageKey(prop)];
+                        return true;
+                    },
+                    has(target, prop) {
+                        return toRealStorageKey(prop) in realStorage || prop in target;
+                    },
+                    ownKeys() {
+                        const list = [];
+                        for (const [key] of Object.entries(realStorage)) {
+                            const proxyKey = fromRealStorageKey(key);
+                            if (proxyKey && !reservedProps.includes(proxyKey)) list.push(proxyKey);
+                        }
+                        return list;
+                    },
+                    getOwnPropertyDescriptor(_, prop) {
+                        return Object.getOwnPropertyDescriptor(realStorage, toRealStorageKey(prop));
+                    },
+                    defineProperty(_, prop, desc) {
+                        if (!reservedProps.includes(prop)) {
+                            Object.defineProperty(realStorage, toRealStorageKey(prop), desc);
+                        }
+                        return true;
+                    }
+                })
+            });
+        };
+        const rewriteFunction = (prop, newFunc) => {
+            Storage.prototype[prop] = new Proxy(Storage.prototype[prop], {
+                apply(_, thisArg, args) {
+                    return newFunc.apply(thisArg, args);
+                }
+            });
+        };
+
+        replaceStorageInstance('localStorage', hammerhead.storages.localStorageProxy.internal.nativeStorage);
+        replaceStorageInstance('sessionStorage', hammerhead.storages.sessionStorageProxy.internal.nativeStorage);
+        rewriteFunction('clear', function () {
+            for (const [key] of Object.entries(this)) {
+                delete this[key];
+            }
+        });
+        rewriteFunction('key', function (keyNum) {
+            return (Object.entries(this)[keyNum] || [])[0] || null;
+        });
+        rewriteFunction('getItem', function (key) {
+            return this.internal.nativeStorage[toRealStorageKey(key)] || null;
+        });
+        rewriteFunction('setItem', function (key, value) {
+            if (key) {
+                this.internal.nativeStorage[toRealStorageKey(key)] = value;
+            }
+        });
+        rewriteFunction('removeItem', function (key) {
+            delete this.internal.nativeStorage[toRealStorageKey(key)];
+        });
+    }
+
+    function hookHammerheadStartOnce(callback) {
+        var originalStart = hammerhead.__proto__.start;
+        hammerhead.__proto__.start = function () {
+            originalStart.apply(this, arguments);
+            hammerhead.__proto__.start = originalStart;
+            callback();
+        };
+    }
+})();
+index.js
+const cluster = require('cluster');
+if (cluster.isMaster) {
+    require('dotenv-flow').config();
+}
+
+const exitHook = require('async-exit-hook');
+const sticky = require('sticky-session-custom');
+const RammerheadProxy = require('../classes/RammerheadProxy');
+const addStaticDirToProxy = require('../util/addStaticDirToProxy');
+const RammerheadSessionFileCache = require('../classes/RammerheadSessionFileCache');
+const config = require('../config');
+const setupRoutes = require('./setupRoutes');
+const setupPipeline = require('./setupPipeline');
+const RammerheadLogging = require('../classes/RammerheadLogging');
+const getSessionId = require('../util/getSessionId');
+
+const enableWorkers = config.workers && config.workers !== 1;
+const prefix = enableWorkers ? (cluster.isMaster ? '(master) ' : `(${cluster.worker.id}) `) : '';
+
+const logger = new RammerheadLogging({
+    logLevel: config.logLevel,
+    generatePrefix: (level) => prefix + config.generatePrefix(level)
+});
+
+const proxyServer = new RammerheadProxy({
+    logger,
+    loggerGetIP: config.getIP,
+    bindingAddress: config.bindingAddress,
+    port: config.port,
+    crossDomainPort: config.crossDomainPort,
+    dontListen: enableWorkers,
+    ssl: config.ssl,
+    getServerInfo: config.getServerInfo,
+    disableLocalStorageSync: config.disableLocalStorageSync,
+    diskJsCachePath: config.diskJsCachePath,
+    jsCacheSize: config.jsCacheSize
+});
+
+if (config.publicDir) addStaticDirToProxy(proxyServer, config.publicDir);
+
+const fileCacheOptions = { logger, ...config.fileCacheSessionConfig };
+if (!cluster.isMaster) {
+    fileCacheOptions.staleCleanupOptions = null;
+}
+const sessionStore = new RammerheadSessionFileCache(fileCacheOptions);
+sessionStore.attachToProxy(proxyServer);
+
+setupPipeline(proxyServer, sessionStore);
+setupRoutes(proxyServer, sessionStore, logger);
+
+// nicely close proxy server and save sessions to store before we exit
+exitHook(() => {
+    logger.info(`(server) Received exit signal, closing proxy server`);
+    proxyServer.close();
+    logger.info('(server) Closed proxy server');
+});
+
+if (!enableWorkers) {
+    const formatUrl = (secure, hostname, port) => `${secure ? 'https' : 'http'}://${hostname}:${port}`;
+    logger.info(
+        `(server) Rammerhead proxy is listening on ${formatUrl(config.ssl, config.bindingAddress, config.port)}`
+    );
+}
+
+// spawn workers if multithreading is enabled //
+if (enableWorkers) {
+    /**
+     * @type {import('sticky-session-custom/lib/sticky/master').MasterOptions}
+     */
+    const stickyOptions = {
+        workers: config.workers,
+        generatePrehashArray(req) {
+            let sessionId = getSessionId(req.url); // /sessionid/url
+            if (!sessionId) {
+                // /editsession?id=sessionid
+                const parsed = new URL(req.url, 'https://a.com');
+                sessionId = parsed.searchParams.get('id') || parsed.searchParams.get('sessionId');
+                if (!sessionId) {
+                    // sessionId is in referer header
+                    for (let i = 0; i < req.headers.length; i += 2) {
+                        if (req.headers[i].toLowerCase() === 'referer') {
+                            sessionId = getSessionId(req.headers[i + 1]);
+                            break;
+                        }
+                    }
+                    if (!sessionId) {
+                        // if there is still none, it's likely a static asset, in which case,
+                        // just delegate it to a worker
+                        sessionId = ' ';
+                    }
+                }
+            }
+            return sessionId.split('').map((e) => e.charCodeAt());
+        }
+    };
+    const closeMasters = [sticky.listen(proxyServer.server1, config.port, config.bindingAddress, stickyOptions)];
+    if (config.crossDomainPort) {
+        closeMasters.push(
+            sticky.listen(proxyServer.server2, config.crossDomainPort, config.bindingAddress, stickyOptions)
+        );
+    }
+
+    if (closeMasters[0]) {
+        // master process //
+        const formatUrl = (secure, hostname, port) => `${secure ? 'https' : 'http'}://${hostname}:${port}`;
+        logger.info(
+            `Rammerhead proxy load balancer is listening on ${formatUrl(
+                config.ssl,
+                config.bindingAddress,
+                config.port
+            )}`
+        );
+
+        // nicely close proxy server and save sessions to store before we exit
+        exitHook(async (done) => {
+            logger.info('Master received exit signal. Shutting down workers');
+            for (const closeMaster of closeMasters) {
+                await new Promise((resolve) => closeMaster(resolve));
+            }
+            logger.info('Closed all workers');
+            done();
+        });
+    } else {
+        logger.info(`Worker ${cluster.worker.id} is running`);
+    }
+}
+setupPipeline.js
+const config = require('../config');
+const getSessionId = require('../util/getSessionId');
+
+/**
+ * @param {import('../classes/RammerheadProxy')} proxyServer
+ * @param {import('../classes/RammerheadSessionAbstractStore')} sessionStore
+ */
+module.exports = function setupPipeline(proxyServer, sessionStore) {
+    // remove headers defined in config.js
+    proxyServer.addToOnRequestPipeline((req, res, _serverInfo, isRoute) => {
+        if (isRoute) return; // only strip those that are going to the proxy destination website
+
+        // restrict session to IP if enabled
+        if (config.restrictSessionToIP) {
+            const sessionId = getSessionId(req.url);
+            const session = sessionId && sessionStore.get(sessionId);
+            if (session && session.data.restrictIP && session.data.restrictIP !== config.getIP(req)) {
+                res.writeHead(403);
+                res.end('Sessions must come from the same IP');
+                return true;
+            }
+        }
+
+        for (const eachHeader of config.stripClientHeaders) {
+            delete req.headers[eachHeader];
+        }
+    });
+    Object.assign(proxyServer.rewriteServerHeaders, config.rewriteServerHeaders);
+};
+setupRoutes.js
+const generateId = require('../util/generateId');
+const URLPath = require('../util/URLPath');
+const httpResponse = require('../util/httpResponse');
+const config = require('../config');
+const StrShuffler = require('../util/StrShuffler');
+const RammerheadSession = require('../classes/RammerheadSession');
+
+/**
+ *
+ * @param {import('../classes/RammerheadProxy')} proxyServer
+ * @param {import('../classes/RammerheadSessionAbstractStore')} sessionStore
+ * @param {import('../classes/RammerheadLogging')} logger
+ */
+module.exports = function setupRoutes(proxyServer, sessionStore, logger) {
+    const isNotAuthorized = (req, res) => {
+        if (!config.password) return;
+        const { pwd } = new URLPath(req.url).getParams();
+        if (config.password !== pwd) {
+            httpResponse.accessForbidden(logger, req, res, config.getIP(req), 'bad password');
+            return true;
+        }
+        return false;
+    };
+    if (process.env.DEVELOPMENT) {
+        proxyServer.GET('/garbageCollect', (req, res) => {
+            global.gc();
+            res.end('Ok');
+        });
+    }
+    proxyServer.GET('/needpassword', (req, res) => {
+        res.end(config.password ? 'true' : 'false');
+    });
+    proxyServer.GET('/newsession', (req, res) => {
+        if (isNotAuthorized(req, res)) return;
+
+        const id = generateId();
+        const session = new RammerheadSession();
+        session.data.restrictIP = config.getIP(req);
+
+        // workaround for saving the modified session to disk
+        sessionStore.addSerializedSession(id, session.serializeSession());
+        res.end(id);
+    });
+    proxyServer.GET('/editsession', (req, res) => {
+        if (isNotAuthorized(req, res)) return;
+
+        let { id, httpProxy, enableShuffling } = new URLPath(req.url).getParams();
+
+        if (!id || !sessionStore.has(id)) {
+            return httpResponse.badRequest(logger, req, res, config.getIP(req), 'not found');
+        }
+
+        const session = sessionStore.get(id);
+
+        if (httpProxy) {
+            if (httpProxy.startsWith('http://')) {
+                httpProxy = httpProxy.slice(7);
+            }
+            session.setExternalProxySettings(httpProxy);
+        } else {
+            session.externalProxySettings = null;
+        }
+        if (enableShuffling === '1' && !session.shuffleDict) {
+            session.shuffleDict = StrShuffler.generateDictionary();
+        }
+        if (enableShuffling === '0') {
+            session.shuffleDict = null;
+        }
+
+        res.end('Success');
+    });
+    proxyServer.GET('/deletesession', (req, res) => {
+        if (isNotAuthorized(req, res)) return;
+
+        const { id } = new URLPath(req.url).getParams();
+
+        if (!id || !sessionStore.has(id)) {
+            res.end('not found');
+            return;
+        }
+
+        sessionStore.delete(id);
+        res.end('Success');
+    });
+    proxyServer.GET('/sessionexists', (req, res) => {
+        const id = new URLPath(req.url).get('id');
+        if (!id) {
+            httpResponse.badRequest(logger, req, res, config.getIP(req), 'Must specify id parameter');
+        } else {
+            res.end(sessionStore.has(id) ? 'exists' : 'not found');
+        }
+    });
+    proxyServer.GET('/mainport', (req, res) => {
+        const serverInfo = config.getServerInfo(req);
+        res.end((serverInfo.port || '').toString());
+    });
+};
+util
+StrShuffler.js
+/*
+
+baseDictionary originally generated with (certain characters was removed to avoid breaking pages):
+
+let str = '';
+for (let i = 32; i <= 126; i++) {
+  let c = String.fromCharCode(i);
+  if (c !== '/' && c !== '_' && encodeURI(c).length === 1) str += c;
+}
+
+*/
+
+const mod = (n, m) => ((n % m) + m) % m;
+const baseDictionary = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz~-';
+const shuffledIndicator = '_rhs';
+const generateDictionary = function () {
+    let str = '';
+    const split = baseDictionary.split('');
+    while (split.length > 0) {
+        str += split.splice(Math.floor(Math.random() * split.length), 1)[0];
+    }
+    return str;
+};
+class StrShuffler {
+    constructor(dictionary = generateDictionary()) {
+        this.dictionary = dictionary;
+    }
+    shuffle(str) {
+        if (str.startsWith(shuffledIndicator)) {
+            return str;
+        }
+        let shuffledStr = '';
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charAt(i);
+            const idx = baseDictionary.indexOf(char);
+            if (char === '%' && str.length - i >= 3) {
+                shuffledStr += char;
+                shuffledStr += str.charAt(++i);
+                shuffledStr += str.charAt(++i);
+            } else if (idx === -1) {
+                shuffledStr += char;
+            } else {
+                shuffledStr += this.dictionary.charAt(mod(idx + i, baseDictionary.length));
+            }
+        }
+        return shuffledIndicator + shuffledStr;
+    }
+    unshuffle(str) {
+        if (!str.startsWith(shuffledIndicator)) {
+            return str;
+        }
+
+        str = str.slice(shuffledIndicator.length);
+
+        let unshuffledStr = '';
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charAt(i);
+            const idx = this.dictionary.indexOf(char);
+            if (char === '%' && str.length - i >= 3) {
+                unshuffledStr += char;
+                unshuffledStr += str.charAt(++i);
+                unshuffledStr += str.charAt(++i);
+            } else if (idx === -1) {
+                unshuffledStr += char;
+            } else {
+                unshuffledStr += baseDictionary.charAt(mod(idx - i, baseDictionary.length));
+            }
+        }
+        return unshuffledStr;
+    }
+}
+
+StrShuffler.baseDictionary = baseDictionary;
+StrShuffler.shuffledIndicator = shuffledIndicator;
+StrShuffler.generateDictionary = generateDictionary;
+
+module.exports = StrShuffler;
+URLPath.js
+/**
+ * for lazy people who don't want to type out `new URL('http://blah' + req.url).searchParams.get(ugh)` all the time
+ */
+module.exports = class URLPath extends URL {
+    /**
+     * @param {string} path - /site/path
+     */
+    constructor(path) {
+        super(path, 'http://foobar');
+    }
+    /**
+     * @param {string} param - ?param=value
+     * @returns {string|null}
+     */
+    get(param) {
+        return this.searchParams.get(param);
+    }
+    /**
+     * @returns {{[param: string]: string}}
+     */
+    getParams() {
+        return Object.fromEntries(this.searchParams);
+    }
+};
+addJSDiskCache.js
+const LRUCache = require('lru-cache');
+const LRUFiles = require('keyv-lru-files');
+const crypto = require('crypto');
+const fs = require('fs');
+
+let cacheGet = async (_key) => {
+    throw new TypeError('cannot cache get: must initialize cache settings first');
+};
+let cacheSet = async (_key, _value) => {
+    throw new TypeError('cannot cache set: must initialize cache settings first');
+};
+
+module.exports = async function (diskJsCachePath, jsCacheSize) {
+    const md5 = (data) => crypto.createHash('md5').update(data).digest('hex');
+
+    if (!diskJsCachePath) {
+        const jsLRUMemCache = new LRUCache({
+            max: jsCacheSize,
+            length: (n) => n.length
+        });
+        cacheGet = (key) => jsLRUMemCache.get(md5(key));
+        cacheSet = (key, value) => jsLRUMemCache.set(md5(key), value);
+    } else {
+        if (!fs.existsSync(diskJsCachePath)) {
+            throw new TypeError('disk cache folder does not exist: ' + diskJsCachePath);
+        }
+        if (!fs.lstatSync(diskJsCachePath).isDirectory()) {
+            throw new TypeError('disk cache folder must be a directory: ' + diskJsCachePath);
+        }
+        const jsLRUFileCache = new LRUFiles({
+            dir: diskJsCachePath,
+            size: jsCacheSize
+        });
+        await jsLRUFileCache.open_sqlite();
+        cacheGet = async (key) => (await jsLRUFileCache.get(md5(key)))?.toString('utf8');
+        cacheSet = async (key, value) => await jsLRUFileCache.set(md5(key), value);
+    }
+};
+
+// patch ScriptResourceProcessor
+// https://github.com/DevExpress/testcafe-hammerhead/blob/7f80940225bc1c615517455dc7d30452b0365243/src/processing/resources/script.ts#L21
+
+const scriptProcessor = require('testcafe-hammerhead/lib/processing/resources/script');
+const { processScript } = require('testcafe-hammerhead/lib/processing/script');
+const { updateScriptImportUrls } = require('testcafe-hammerhead/lib/utils/url');
+const BUILTIN_HEADERS = require('testcafe-hammerhead/lib/request-pipeline/builtin-header-names');
+
+scriptProcessor.__proto__.processResource = async function processResource(script, ctx, _charset, urlReplacer) {
+    if (!script) return script;
+
+    let processedScript = await cacheGet(script);
+
+    if (!processedScript) {
+        processedScript = processScript(
+            script,
+            true,
+            false,
+            urlReplacer,
+            ctx.destRes.headers[BUILTIN_HEADERS.serviceWorkerAllowed]
+        );
+        await cacheSet(script, processedScript);
+    } else processedScript = updateScriptImportUrls(processedScript, ctx.serverInfo, ctx.session.id, ctx.windowId);
+
+    return processedScript;
+};
+addMoreErrorGuards.js
+// handle the additional errors: ERR_INVALID_PROTOCOL and ETIMEDOUT
+// hammerhead handled errors: ECONNRESET, EPIPE (or ECONNABORTED for windows)
+
+const hGuard = require('testcafe-hammerhead/lib/request-pipeline/connection-reset-guard');
+const isConnectionResetError = hGuard.isConnectionResetError;
+hGuard.isConnectionResetError = function (err) {
+    // for some reason, ECONNRESET isn't handled correctly
+    if (
+        isConnectionResetError(err) ||
+        err.code === 'ERR_INVALID_PROTOCOL' ||
+        err.code === 'ETIMEDOUT' ||
+        err.code === 'ECONNRESET' ||
+        err.code === 'EPIPE'
+    ) {
+        return true;
+    }
+    console.error('Unknown crash-inducing error:', err);
+    // never return false as to avoid crashing the server
+    return true;
+};
+
+process.on('uncaughtException', (err) => {
+    // for some reason, the above never catches all of the errors. this is a last resort failsafe
+    if (
+        err.message.includes('ECONN') ||
+        err.message.includes('EPIPE') ||
+        err.message.includes('ETIMEDOUT') ||
+        err.message.includes('ERR_INVALID_')
+    ) {
+        // crash avoided!
+        console.error('Avoided crash:' + err.message);
+    } else {
+        // probably a TypeError or something important
+        console.error('About to throw: ' + err.message);
+        throw err;
+    }
+});
+addStaticDirToProxy.js
+const mime = require('mime');
+const fs = require('fs');
+const path = require('path');
+
+// these routes are reserved by hammerhead and rammerhead
+const forbiddenRoutes = [
+    '/rammerhead.js',
+    '/hammerhead.js',
+    '/task.js',
+    '/iframe-task.js',
+    '/messaging',
+    '/transport-worker.js',
+    '/worker-hammerhead.js'
+];
+
+const isDirectory = (dir) => fs.lstatSync(dir).isDirectory();
+
+/**
+ *
+ * @param {import('testcafe-hammerhead').Proxy} proxy
+ * @param {string} staticDir - all of the files and folders in the specified directory will be served
+ * publicly. /index.html will automatically link to /
+ * @param {string} rootPath - all the files that will be served under rootPath
+ */
+function addStaticFilesToProxy(proxy, staticDir, rootPath = '/', shouldIgnoreFile = (_file, _dir) => false) {
+    if (!isDirectory(staticDir)) {
+        throw new TypeError('specified folder path is not a directory');
+    }
+
+    if (!rootPath.endsWith('/')) rootPath = rootPath + '/';
+    if (!rootPath.startsWith('/')) rootPath = '/' + rootPath;
+
+    const files = fs.readdirSync(staticDir);
+
+    files.map((file) => {
+        if (isDirectory(path.join(staticDir, file))) {
+            addStaticFilesToProxy(proxy, path.join(staticDir, file), rootPath + file + '/', shouldIgnoreFile);
+            return;
+        }
+
+        if (shouldIgnoreFile(file, staticDir)) {
+            return;
+        }
+
+        const pathToFile = path.join(staticDir, file);
+        const staticContent = {
+            content: fs.readFileSync(pathToFile),
+            contentType: mime.getType(file)
+        };
+        const route = rootPath + file;
+
+        if (forbiddenRoutes.includes(route)) {
+            throw new TypeError(
+                `route clashes with hammerhead. problematic route: ${route}. problematic static file: ${pathToFile}`
+            );
+        }
+
+        proxy.GET(rootPath + file, staticContent);
+        if (file === 'index.html') {
+            proxy.GET(rootPath, staticContent);
+        }
+    });
+}
+
+module.exports = addStaticFilesToProxy;
+addUrlShuffling.js
+const RequestPipelineContext = require('testcafe-hammerhead/lib/request-pipeline/context');
+const StrShuffler = require('./StrShuffler');
+const getSessionId = require('./getSessionId');
+
+const replaceUrl = (url, replacer) => {
+    //        regex:              https://google.com/    sessionid/   url
+    return (url || '').replace(/^((?:[a-z0-9]+:\/\/[^/]+)?(?:\/[^/]+\/))([^]+)/i, function (_, g1, g2) {
+        return g1 + replacer(g2);
+    });
+};
+
+// unshuffle incoming url //
+const BUILTIN_HEADERS = require('testcafe-hammerhead/lib/request-pipeline/builtin-header-names');
+const _dispatch = RequestPipelineContext.prototype.dispatch;
+RequestPipelineContext.prototype.dispatch = function (openSessions) {
+    let sessionId = getSessionId(this.req.url);
+    let session = sessionId && openSessions.get(sessionId);
+    if (!session) {
+        sessionId = getSessionId(this.req.headers[BUILTIN_HEADERS.referer]);
+        session = sessionId && openSessions.get(sessionId);
+    }
+    if (session && session.shuffleDict) {
+        const shuffler = new StrShuffler(session.shuffleDict);
+        this.req.url = replaceUrl(this.req.url, (url) => shuffler.unshuffle(url));
+        if (getSessionId(this.req.headers[BUILTIN_HEADERS.referer]) === sessionId) {
+            this.req.headers[BUILTIN_HEADERS.referer] = replaceUrl(this.req.headers[BUILTIN_HEADERS.referer], (url) =>
+                shuffler.unshuffle(url)
+            );
+        }
+    }
+
+    return _dispatch.call(this, openSessions);
+};
+
+// shuffle rewritten proxy urls //
+let disableShuffling = false; // for later use
+const _toProxyUrl = RequestPipelineContext.prototype.toProxyUrl;
+RequestPipelineContext.prototype.toProxyUrl = function (...args) {
+    const proxyUrl = _toProxyUrl.apply(this, args);
+
+    if (!this.session.shuffleDict || disableShuffling) return proxyUrl;
+
+    const shuffler = new StrShuffler(this.session.shuffleDict);
+    return replaceUrl(proxyUrl, (url) => shuffler.shuffle(url));
+};
+
+// unshuffle task.js referer header
+const Proxy = require('testcafe-hammerhead/lib/proxy/index');
+const __onTaskScriptRequest = Proxy.prototype._onTaskScriptRequest;
+Proxy.prototype._onTaskScriptRequest = async function _onTaskScriptRequest(req, ...args) {
+    const referer = req.headers[BUILTIN_HEADERS.referer];
+
+    const sessionId = getSessionId(referer);
+    const session = sessionId && this.openSessions.get(sessionId);
+    if (session && session.shuffleDict) {
+        const shuffler = new StrShuffler(session.shuffleDict);
+        req.headers[BUILTIN_HEADERS.referer] = replaceUrl(req.headers[BUILTIN_HEADERS.referer], (url) =>
+            shuffler.unshuffle(url)
+        );
+    }
+    return __onTaskScriptRequest.call(this, req, ...args);
+};
+
+// don't shuffle action urls (because we don't get to control the rewriting when the user submits the form)
+const DomProcessor = require('testcafe-hammerhead/lib/processing/dom/index');
+const __processUrlAttrs = DomProcessor.prototype._processUrlAttrs;
+DomProcessor.prototype._processUrlAttrs = function _processUrlAttrs(el, urlReplacer, pattern) {
+    try {
+        disableShuffling = pattern.urlAttr?.toLowerCase() === 'action';
+        __processUrlAttrs.call(this, el, urlReplacer, pattern);
+        disableShuffling = false;
+    } catch (e) {
+        disableShuffling = false;
+        throw e;
+    }
+};
+fixCorsHeader.js
+const urlUtils = require('testcafe-hammerhead/lib/utils/url');
+const RequestPipelineContext = require('testcafe-hammerhead/lib/request-pipeline/context');
+
+/**
+ * if a non-crossdomain origin makes a request to a crossdomain port, the ports are flipped. this is to fix that issue.
+ * there is also another issue with https://domain and https://domain:443 not matching. port 443/80 are automatically
+ * removed if https and 443, and http and 80.
+ * original: https://github.com/DevExpress/testcafe-hammerhead/blob/f5b0508d10614bf39a75c772dc6bd01c24f29417/src/request-pipeline/context.ts#L436
+ */
+RequestPipelineContext.prototype.getProxyOrigin = function getProxyOrigin(isCrossDomain = false) {
+    // if we receive a request that has a proxy origin header, (ctx.getProxyOrigin(!!ctx.dest.reqOrigin),
+    // https://github.com/DevExpress/testcafe-hammerhead/blob/f5b0508d10614bf39a75c772dc6bd01c24f29417/src/request-pipeline/header-transforms/transforms.ts#L128),
+    // then we must return the other port over. however, the issue with this is we don't know if the incoming request is actually a
+    // crossdomain port (a simple check for reqOrigin cannot suffice, as a request from a non-crossdomain origin to a crossdomain port and
+    // vice versa can happen),
+    // so this will fix the issue from non-crossdomain port to crossdomain-port but will NOT fix crosdomain-port to non-crossdomain port.
+    // However, the latter case will never happen because hammerhead made all client rewriting cross-domain requests to always use the
+    // cross-domain ports, even if the origin is from a cross-domain port.
+    const port = isCrossDomain ? this.serverInfo.port : this.serverInfo.crossDomainPort;
+
+    // don't add a port if port is 443 and protocol is https:, and don't add a port if port is 80 and protocol is http:.
+    // note that this isn't supported by the client rewriting, so client hammerhead's port.toString() will throw an error
+    const hostPort =
+        (this.serverInfo.protocol == 'https:' && port == 443) || (this.serverInfo.protocol == 'http:' && port == 80)
+            ? null
+            : port;
+
+    return urlUtils.getDomain({
+        protocol: this.serverInfo.protocol,
+        // use host instead of hostname so we can manually add in the port
+        host: this.serverInfo.hostname + (hostPort ? ':' + hostPort : '')
+    });
+};
+fixWebsocket.js
+// fixes unpipe error and crashes resulting from http requests to websocket proxy endpoint
+
+const stages = require('testcafe-hammerhead/lib/request-pipeline/stages');
+const { Duplex } = require('stream');
+
+stages.unshift(function fixWebsocket(ctx) {
+    ctx.isWebSocket = ctx.res instanceof Duplex;
+});
+
+// fixes EPIPE error when trying to write head to a closed socket
+const hammerheadWS = require('testcafe-hammerhead/lib/request-pipeline/websocket');
+const respondOnWebSocket = hammerheadWS.respondOnWebSocket;
+hammerheadWS.respondOnWebSocket = function (ctx) {
+    ctx.res.on('error', (err) => {
+        if (err.code !== 'EPIPE') {
+            console.error('Unknown crash-inducing error:', err);
+        }
+        // cleanup end will automatically be handled by the 'end' listener
+    });
+    respondOnWebSocket(ctx);
+};
+generateId.js
+const uuid = require('uuid').v4;
+
+module.exports = () => uuid().replace(/-/g, '');
+getSessionId.js
+module.exports = (reqPath) => ((reqPath || '').match(/^(?:[a-z0-9]+:\/\/[^/]+)?\/([a-z0-9]{32})/i) || [])[1];
+httpResponse.js
+patchAsyncResourceProcessor.js
+// https://github.com/DevExpress/testcafe-hammerhead/blob/7f80940225bc1c615517455dc7d30452b0365243/src/processing/resources/index.ts
+
+const url = require('url');
+const pageProcessor = require('testcafe-hammerhead/lib/processing/resources/page');
+const manifestProcessor = require('testcafe-hammerhead/lib/processing/resources/manifest');
+const scriptProcessor = require('testcafe-hammerhead/lib/processing/resources/script');
+const stylesheetProcessor = require('testcafe-hammerhead/lib/processing/resources/stylesheet');
+const urlUtil = require('testcafe-hammerhead/lib/utils/url');
+const { encodeContent, decodeContent } = require('testcafe-hammerhead/lib/processing/encoding');
+const { platform } = require('os');
+
+const IS_WIN = platform() === 'win32';
+const DISK_RE = /^[A-Za-z]:/;
+const RESOURCE_PROCESSORS = [pageProcessor, manifestProcessor, scriptProcessor, stylesheetProcessor];
+
+function getResourceUrlReplacer(ctx) {
+    return function (resourceUrl, resourceType, charsetAttrValue, baseUrl, isCrossDomain) {
+        if (!urlUtil.isSupportedProtocol(resourceUrl) && !urlUtil.isSpecialPage(resourceUrl)) return resourceUrl;
+
+        if (IS_WIN && ctx.dest.protocol === 'file:' && DISK_RE.test(resourceUrl)) resourceUrl = '/' + resourceUrl;
+
+        // NOTE: Resolves base URLs without a protocol ('//google.com/path' for example).
+        baseUrl = baseUrl ? url.resolve(ctx.dest.url, baseUrl) : '';
+        resourceUrl = urlUtil.processSpecialChars(resourceUrl);
+
+        let resolvedUrl = url.resolve(baseUrl || ctx.dest.url, resourceUrl);
+
+        if (!urlUtil.isValidUrl(resolvedUrl)) return resourceUrl;
+
+        // NOTE: Script or <link rel='preload' as='script'>
+        const isScriptLike = urlUtil.parseResourceType(resourceType).isScript;
+        const charsetStr = charsetAttrValue || (isScriptLike && ctx.contentInfo.charset.get());
+
+        resolvedUrl = urlUtil.ensureTrailingSlash(resourceUrl, resolvedUrl);
+
+        if (!urlUtil.isValidUrl(resolvedUrl)) return resolvedUrl;
+
+        return ctx.toProxyUrl(resolvedUrl, isCrossDomain, resourceType, charsetStr);
+    };
+}
+
+require('testcafe-hammerhead/lib/processing/resources/index').process = async function process(ctx) {
+    const { destResBody, contentInfo } = ctx;
+    const { encoding, charset } = contentInfo;
+
+    for (const processor of RESOURCE_PROCESSORS) {
+        if (!processor.shouldProcessResource(ctx)) continue;
+
+        const urlReplacer = getResourceUrlReplacer(ctx);
+
+        if (pageProcessor === processor) await ctx.prepareInjectableUserScripts();
+
+        const decoded = await decodeContent(destResBody, encoding, charset);
+
+        // @ts-ignore: Cannot invoke an expression whose type lacks a call signature
+        const processed = await processor.processResource(decoded, ctx, charset, urlReplacer); // <-- add async support
+
+        if (processed === pageProcessor.RESTART_PROCESSING) return await process(ctx);
+
+        return await encodeContent(processed, encoding, charset);
+    }
+
+    return destResBody;
+};
+streamToString.js
+module.exports = function streamToString(stream) {
+    const chunks = [];
+    return new Promise((resolve, reject) => {
+        stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        stream.on('error', (err) => reject(err));
+        stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    });
+};
+require('dotenv-flow').config();
+
+const path = require('path');
+const fs = require('fs');
+const UglifyJS = require('uglify-js');
+
+// modify unmodifable items that cannot be hooked in rammerhead.js
+fs.writeFileSync(
+    path.join(__dirname, './client/hammerhead.js'),
+    // part of fix for iframing issue
+    'window["%is-hammerhead%"] = true;\n' +
+        fs
+            .readFileSync(path.join(__dirname, '../node_modules/testcafe-hammerhead/lib/client/hammerhead.js'), 'utf8')
+            // fix iframing proxy issue
+            .replace(
+                /window === window\.top/g,
+                '((window.parent === window.top && !window.top["%hammerhead%"]) || window === window.top)'
+            )
+            .replace(
+                'isCrossDomainParent = parentLocationWrapper === parentWindow.location',
+                'isCrossDomainParent = parentLocationWrapper === parentWindow.location || !parentWindow["%hammerhead%"]'
+            )
+            .replace(
+                '!sameOriginCheck(window1Location, window2Location)',
+                '!(sameOriginCheck(window1Location, window2Location) && (!!window1["%is-hammerhead%"] === !!window2["%is-hammerhead%"]))'
+            )
+            // return false when unable to convert properties on other windows to booleans (!)
+            .replace(
+                /!(parent|parentWindow|window1|window2|window\.top)\[("%(?:is-)?hammerhead%")]/g,
+                '!(() => { try{ return $1[$2]; }catch(error){ return true } })()'
+            )
+
+            // disable saving to localStorage as we are using a completely different implementation
+            .replace('saveToNativeStorage = function () {', 'saveToNativeStorage = function () {return;')
+
+            // prevent calls to elements on a closed iframe
+            .replace('dispatchEvent: function () {', '$& if (!window) return null;')
+            .replace('click: function () {', '$& if (!window) return null;')
+            .replace('setSelectionRange: function () {', '$& if (!window) return null;')
+            .replace('select: function () {', '$& if (!window) return null;')
+            .replace('focus: function () {', '$& if (!window) return null;')
+            .replace('blur: function () {', '$& if (!window) return null;')
+            .replace('preventDefault: function () {', '$& if (!window) return null;')
+
+            // expose hooks for rammerhead.js
+            .replace(
+                'function parseProxyUrl$1',
+                'window.overrideParseProxyUrl = function(rewrite) {parseProxyUrl$$1 = rewrite(parseProxyUrl$$1)}; $&'
+index.js
+const RammerheadProxy = require('./classes/RammerheadProxy');
+const RammerheadLogging = require('./classes/RammerheadLogging');
+const RammerheadSession = require('./classes/RammerheadSession');
+const RammerheadSessionAbstractStore = require('./classes/RammerheadSessionAbstractStore');
+const RammerheadSessionFileCache = require('./classes/RammerheadSessionFileCache');
+const generateId = require('./util/generateId');
+const addStaticFilesToProxy = require('./util/addStaticDirToProxy');
+const RammerheadSessionMemoryStore = require('./classes/RammerheadMemoryStore');
+const StrShuffler = require('./util/StrShuffler');
+const URLPath = require('./util/URLPath');
+
+module.exports = {
+    RammerheadProxy,
+    RammerheadLogging,
+    RammerheadSession,
+    RammerheadSessionAbstractStore,
+    RammerheadSessionMemoryStore,
+    RammerheadSessionFileCache,
+    StrShuffler,
+    generateId,
+    addStaticFilesToProxy,
+    URLPath
+};
+build.js
+require('dotenv-flow').config();
+
+const path = require('path');
+const fs = require('fs');
+const UglifyJS = require('uglify-js');
+
+// modify unmodifable items that cannot be hooked in rammerhead.js
+fs.writeFileSync(
+    path.join(__dirname, './client/hammerhead.js'),
+    // part of fix for iframing issue
+    'window["%is-hammerhead%"] = true;\n' +
+        fs
+            .readFileSync(path.join(__dirname, '../node_modules/testcafe-hammerhead/lib/client/hammerhead.js'), 'utf8')
+            // fix iframing proxy issue
+            .replace(
+                /window === window\.top/g,
+                '((window.parent === window.top && !window.top["%hammerhead%"]) || window === window.top)'
+            )
+            .replace(
+                'isCrossDomainParent = parentLocationWrapper === parentWindow.location',
+                'isCrossDomainParent = parentLocationWrapper === parentWindow.location || !parentWindow["%hammerhead%"]'
+            )
+            .replace(
+                '!sameOriginCheck(window1Location, window2Location)',
+                '!(sameOriginCheck(window1Location, window2Location) && (!!window1["%is-hammerhead%"] === !!window2["%is-hammerhead%"]))'
+            )
+            // return false when unable to convert properties on other windows to booleans (!)
+            .replace(
+                /!(parent|parentWindow|window1|window2|window\.top)\[("%(?:is-)?hammerhead%")]/g,
+                '!(() => { try{ return $1[$2]; }catch(error){ return true } })()'
+            )
+
+            // disable saving to localStorage as we are using a completely different implementation
+            .replace('saveToNativeStorage = function () {', 'saveToNativeStorage = function () {return;')
+
+            // prevent calls to elements on a closed iframe
+            .replace('dispatchEvent: function () {', '$& if (!window) return null;')
+            .replace('click: function () {', '$& if (!window) return null;')
+            .replace('setSelectionRange: function () {', '$& if (!window) return null;')
+            .replace('select: function () {', '$& if (!window) return null;')
+            .replace('focus: function () {', '$& if (!window) return null;')
+            .replace('blur: function () {', '$& if (!window) return null;')
+            .replace('preventDefault: function () {', '$& if (!window) return null;')
+
+            // expose hooks for rammerhead.js
+            .replace(
+                'function parseProxyUrl$1',
+                'window.overrideParseProxyUrl = function(rewrite) {parseProxyUrl$$1 = rewrite(parseProxyUrl$$1)}; $&'
+            )
+            .replace(
+                'function getProxyUrl$1',
+                'window.overrideGetProxyUrl = function(rewrite) {getProxyUrl$$1 = rewrite(getProxyUrl$$1)}; $&'
+            )
+            .replace('return window.location.search;', 'return (new URL(get$$2())).search;')
+            .replace('return window.location.hash;', 'return (new URL(get$$2())).hash;')
+            .replace(
+                'setter: function (search) {',
+                '$& var url = new URL(get$$2()); url.search = search; window.location = convertToProxyUrl(url.href); return search;'
+            )
+            .replace(
+                'setter: function (hash) {',
+                '$& var url = new URL(get$$2()); url.hash = hash; window.location.hash = (new URL(convertToProxyUrl(url.href))).hash; return hash;'
+            )
+);
+
+const minify = (fileName, newFileName) => {
+    const minified = UglifyJS.minify(fs.readFileSync(path.join(__dirname, './client', fileName), 'utf8'));
+    if (minified.error) {
+        throw minified.error;
+    }
+    fs.writeFileSync(path.join(__dirname, './client', newFileName), minified.code, 'utf8');
+};
+
+minify('rammerhead.js', 'rammerhead.min.js');
+minify('hammerhead.js', 'hammerhead.min.js');
+config.js
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+
+module.exports = {
+    //// HOSTING CONFIGURATION ////
+
+    bindingAddress: '127.0.0.1',
+    port: 8080,
+    crossDomainPort: 8081,
+    publicDir: path.join(__dirname, '../public'), // set to null to disable
+
+    // if workers is null or 1, multithreading is disabled
+    workers: os.cpus().length,
+
+    // ssl object is either null or { key: fs.readFileSync('path/to/key'), cert: fs.readFileSync('path/to/cert') }
+    // for more info, see https://nodejs.org/api/https.html#https_https_createserver_options_requestlistener
+    ssl: null,
+
+    // this function's return object will determine how the client url rewriting will work.
+    // set them differently from bindingAddress and port if rammerhead is being served
+    // from a reverse proxy.
+    getServerInfo: () => ({ hostname: 'localhost', port: 8080, crossDomainPort: 8081, protocol: 'http:' }),
+    // example of non-hard-coding the hostname header
+    // getServerInfo: (req) => {
+    //     return { hostname: new URL('http://' + req.headers.host).hostname, port: 443, crossDomainPort: 8443, protocol: 'https: };
+    // },
+
+    // enforce a password for creating new sessions. set to null to disable
+    password: 'sharkie4life',
+
+    // disable or enable localStorage sync (turn off if clients send over huge localStorage data, resulting in huge memory usages)
+    disableLocalStorageSync: false,
+
+    // restrict sessions to be only used per IP
+    restrictSessionToIP: true,
+
+    // use disk for caching js rewrites. set to null to use memory instead (not recommended for HDD disks)
+    diskJsCachePath: path.join(__dirname, '../cache-js'),
+    jsCacheSize: 5 * 1024 * 1024 * 1024, // recommended: 50mb for memory, 5gb for disk
+
+    //// REWRITE HEADER CONFIGURATION ////
+
+    // removes reverse proxy headers
+    // cloudflare example:
+    // stripClientHeaders: ['cf-ipcountry', 'cf-ray', 'x-forwarded-proto', 'cf-visitor', 'cf-connecting-ip', 'cdn-loop', 'x-forwarded-for'],
+    stripClientHeaders: [],
+    // if you want to modify response headers, like removing the x-frame-options header, do it like so:
+    // rewriteServerHeaders: {
+    //     // you can also specify a function to modify/add the header using the original value (undefined if adding the header)
+    //     // 'x-frame-options': (originalHeaderValue) => '',
+    //     'x-frame-options': null, // set to null to tell rammerhead that you want to delete it
+    // },
+    rewriteServerHeaders: {},
+
+    //// SESSION STORE CONFIG ////
+
+    // see src/classes/RammerheadSessionFileCache.js for more details and options
+    fileCacheSessionConfig: {
+        saveDirectory: path.join(__dirname, '../sessions'),
+        cacheTimeout: 1000 * 60 * 20, // 20 minutes
+        cacheCheckInterval: 1000 * 60 * 10, // 10 minutes
+        deleteUnused: true,
+        staleCleanupOptions: {
+            staleTimeout: 1000 * 60 * 60 * 24 * 3, // 3 days
+            maxToLive: null,
+            staleCheckInterval: 1000 * 60 * 60 * 6 // 6 hours
+        },
+        // corrupted session files happens when nodejs exits abruptly while serializing the JSON sessions to disk
+        deleteCorruptedSessions: true,
+    },
+
+    //// LOGGING CONFIGURATION ////
+
+    // valid values: 'disabled', 'debug', 'traffic', 'info', 'warn', 'error'
+    logLevel: process.env.DEVELOPMENT ? 'debug' : 'info',
+    generatePrefix: (level) => `[${new Date().toISOString()}] [${level.toUpperCase()}] `,
+
+    // logger depends on this value
+    getIP: (req) => req.socket.remoteAddress
+    // use the example below if rammerhead is sitting behind a reverse proxy like nginx
+    // getIP: req => (req.headers['x-forwarded-for'] || req.connection.remoteAddress || '').split(',')[0].trim()
+};
+
+if (fs.existsSync(path.join(__dirname, '../config.js'))) Object.assign(module.exports, require('../config'));
+index.js
+const RammerheadProxy = require('./classes/RammerheadProxy');
+const RammerheadLogging = require('./classes/RammerheadLogging');
+const RammerheadSession = require('./classes/RammerheadSession');
+const RammerheadSessionAbstractStore = require('./classes/RammerheadSessionAbstractStore');
+const RammerheadSessionFileCache = require('./classes/RammerheadSessionFileCache');
+const generateId = require('./util/generateId');
+const addStaticFilesToProxy = require('./util/addStaticDirToProxy');
+const RammerheadSessionMemoryStore = require('./classes/RammerheadMemoryStore');
+const StrShuffler = require('./util/StrShuffler');
+const URLPath = require('./util/URLPath');
+
+module.exports = {
+    RammerheadProxy,
+    RammerheadLogging,
+    RammerheadSession,
+    RammerheadSessionAbstractStore,
+    RammerheadSessionMemoryStore,
+    RammerheadSessionFileCache,
+    StrShuffler,
+    generateId,
+    addStaticFilesToProxy,
+    URLPath
+};
+sever.js
+require('./server/index.js');
